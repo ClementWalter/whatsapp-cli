@@ -29,6 +29,7 @@ CHATS_PATH = CACHE_DIR / "chats.json"
 CONTACTS_PATH = CACHE_DIR / "contacts.json"
 LIDMAP_PATH = CACHE_DIR / "lidmap.json"
 GROUP_FETCHES_PATH = CACHE_DIR / "group_fetches.json"
+SYNC_STATE_PATH = CACHE_DIR / "sync_state.json"
 
 
 @dataclass
@@ -102,6 +103,17 @@ def load_group_fetches() -> dict[str, int]:
 
 def save_group_fetches(fetches: dict[str, int]) -> None:
     _atomic_write_json(GROUP_FETCHES_PATH, fetches)
+
+
+def load_sync_state() -> dict:
+    """Last-sync bookkeeping: ``{last_sync_ts: int, last_frames: int}``."""
+    if not SYNC_STATE_PATH.exists():
+        return {}
+    return json.loads(SYNC_STATE_PATH.read_text())
+
+
+def save_sync_state(state: dict) -> None:
+    _atomic_write_json(SYNC_STATE_PATH, state)
 
 
 def append_messages(messages: list[CachedMessage]) -> None:
