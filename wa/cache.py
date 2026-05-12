@@ -24,6 +24,7 @@ from typing import Iterator
 log = logging.getLogger(__name__)
 
 CACHE_DIR = Path.home() / ".cache" / "whatsapp-user-cli" / "store"
+LOCK_PATH = Path.home() / ".cache" / "whatsapp-user-cli" / ".connection.lock"
 MESSAGES_PATH = CACHE_DIR / "messages.jsonl"
 CHATS_PATH = CACHE_DIR / "chats.json"
 CONTACTS_PATH = CACHE_DIR / "contacts.json"
@@ -114,6 +115,63 @@ def load_sync_state() -> dict:
 
 def save_sync_state(state: dict) -> None:
     _atomic_write_json(SYNC_STATE_PATH, state)
+
+
+class connection_lock:
+    """File-lock around the one WebSocket session this CLI holds.
+
+    WhatsApp's server treats each linked-device JID as having a single
+    live connection; if two `wa` invocations connect at once, the older
+    one is silently kicked. Worse, both sides write to ``signal.json``
+    on session updates, so a racing pair can leave the ratchet state
+    torn. Wrap every command that opens a FrameSocket in this CM:
+    ``with connection_lock():`` blocks if another process holds it (or
+    fails fast with ``blocking=False``).
+    """
+
+    def __init__(self, *, blocking: bool = True, stale_seconds: float = 300.0) -> None:
+        self._blocking = blocking
+        self._stale_seconds = stale_seconds
+        self._fh = None
+
+    def __enter__(self) -> "connection_lock":
+        import fcntl
+        import time as _time
+
+        LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        # A pre-existing lock file with a stale mtime is fine to reuse;
+        # what matters is whether `flock` grants us the advisory lock.
+        if LOCK_PATH.exists():
+            age = _time.time() - LOCK_PATH.stat().st_mtime
+            if age > self._stale_seconds:
+                log.debug("lock file is %.0fs old; will reacquire if owner is gone", age)
+        self._fh = open(LOCK_PATH, "w")
+        flags = fcntl.LOCK_EX
+        if not self._blocking:
+            flags |= fcntl.LOCK_NB
+        try:
+            fcntl.flock(self._fh.fileno(), flags)
+        except BlockingIOError:
+            self._fh.close()
+            self._fh = None
+            raise RuntimeError(
+                f"another `wa` process holds the connection lock ({LOCK_PATH}). "
+                f"Wait for it to finish or kill the other process."
+            )
+        self._fh.write(f"{os.getpid()}\n")
+        self._fh.flush()
+        return self
+
+    def __exit__(self, *exc) -> None:
+        import fcntl
+
+        if self._fh is not None:
+            try:
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except Exception:
+                pass
+            self._fh.close()
+            self._fh = None
 
 
 def canonical_jid(
