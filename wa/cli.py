@@ -777,38 +777,228 @@ def send(peer: str, text: str) -> None:
     asyncio.run(_send_async(dev, peer_jid, text))
 
 
+def _phash(devices: list[JID]) -> str:
+    """Compute the participant-list hash whatsmeow calls ``phash``.
+
+    The server uses this to verify the sender's device-list view is
+    current — a mismatch means a device was added/removed since our
+    last usync, and the message will be rejected with `phash-mismatch`.
+    Format: ``"2:" + base64(sha256(sorted_ad_strings_concatenated)[:6])``,
+    standard base64 with padding stripped. Must match whatsmeow's
+    ``participantListHashV2`` byte-for-byte.
+    """
+    import base64
+    import hashlib
+
+    ad_strs = sorted(d.ad_string() for d in devices)
+    digest = hashlib.sha256("".join(ad_strs).encode()).digest()[:6]
+    return "2:" + base64.b64encode(digest).decode().rstrip("=")
+
+
+async def _usync_devices(
+    fs: FrameSocket, ns, queried: list[JID]
+) -> list[JID]:
+    """Query the server for every JID's device list.
+
+    Returns the union of every ``<device-list><device id="N"/></device-list>``,
+    as fully-specified AD JIDs (with the right ``device`` field set).
+    Mirrors whatsmeow's ``GetUserDevices``.
+    """
+    import secrets
+
+    sid = secrets.token_hex(8)
+    iq_id = f"usync-dev-{sid[:6]}"
+    iq = Node(
+        tag="iq",
+        attrs={
+            "to": JID(server="s.whatsapp.net"),
+            "type": "get",
+            "id": iq_id,
+            "xmlns": "usync",
+        },
+        content=[
+            Node(
+                tag="usync",
+                attrs={
+                    "sid": sid,
+                    "mode": "query",
+                    "last": "true",
+                    "index": "0",
+                    "context": "message",
+                },
+                content=[
+                    Node(
+                        tag="query",
+                        content=[Node(tag="devices", attrs={"version": "2"})],
+                    ),
+                    Node(
+                        tag="list",
+                        content=[Node(tag="user", attrs={"jid": j}) for j in queried],
+                    ),
+                ],
+            )
+        ],
+    )
+    await fs.send(ns.encrypt_frame(encode_node(iq)))
+    deadline = asyncio.get_event_loop().time() + 8.0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            ct = await fs.recv(timeout=max(0.1, deadline - asyncio.get_event_loop().time()))
+        except (asyncio.TimeoutError, ConnectionError):
+            break
+        try:
+            node = decode_node(ns.decrypt_frame(ct))
+        except Exception:
+            continue
+        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+            continue
+        if node.attrs.get("type") == "error":
+            err = node.get_child_by_tag("error")
+            raise RuntimeError(f"usync rejected: {err.attrs if err else node.attrs}")
+        lst = node.get_child_by_tag("usync", "list")
+        if lst is None:
+            return []
+        out: list[JID] = []
+        for user_node in lst.get_children():
+            if user_node.tag != "user":
+                continue
+            user_jid = user_node.attrs.get("jid")
+            if not isinstance(user_jid, JID):
+                continue
+            dl = user_node.get_child_by_tag("devices", "device-list")
+            if dl is None:
+                continue
+            for dev_node in dl.get_children():
+                if dev_node.tag != "device":
+                    continue
+                try:
+                    dev_id = int(dev_node.attrs.get("id", 0))
+                except (TypeError, ValueError):
+                    continue
+                out.append(
+                    JID(
+                        user=user_jid.user,
+                        server=user_jid.server,
+                        agent=user_jid.agent,
+                        device=dev_id,
+                    )
+                )
+        return out
+    raise TimeoutError("usync device query timed out")
+
+
+def _build_message_plaintext(text: str) -> bytes:
+    """Encode a minimal ``waE2E.Message{conversation: text}`` on the wire.
+
+    Field 1 is the ``conversation`` string. We hand-roll the proto wire
+    format rather than vendor a .proto, because this is the only outbound
+    structure we currently produce.
+    """
+    from wa.peerreq import _string_field
+
+    return _string_field(1, text)
+
+
+def _build_dsm_plaintext(text: str, destination_jid: str) -> bytes:
+    """Wrap a Message in ``deviceSentMessage`` for own-other-device fan-out.
+
+    Schema: ``Message { deviceSentMessage = 31: DeviceSentMessage {
+    destinationJID = 1: string; message = 2: Message } }``. Encrypted
+    copy goes to every linked device of *yours* so they show the
+    outgoing message in their UI.
+    """
+    from wa.peerreq import _length_delim, _string_field
+
+    inner = _string_field(1, text)  # nested Message{conversation: text}
+    dsm = _string_field(1, destination_jid) + _length_delim(2, inner)
+    return _length_delim(31, dsm)
+
+
 async def _send_async(device: Device, peer_jid: str, text: str) -> None:
-    """Single-shot send: login, encrypt, transmit, await ack, exit."""
+    """Single-shot send: login, usync devices, encrypt per device, transmit, ack.
+
+    Implements the same protocol whatsmeow uses for ``sendDM``:
+
+    1. ``usync`` the peer + own JID → list of AD JIDs (every device).
+    2. Encrypt the bare ``Message`` for each peer device, the wrapping
+       ``deviceSentMessage`` for each of our own other devices. Skip
+       the current device (this CLI) — we don't echo to ourselves.
+    3. Build ``<message><participants><to jid=...><enc/></to>...</participants></message>``
+       with the ``phash`` set so the server accepts our device-list view.
+    4. Send and await ``<ack class="message" id="...">``.
+
+    Devices for which we have no Signal session yet are skipped with a
+    warning; pre-key bundle fetch isn't wired up. The peer's primary
+    phone (device 0) almost always has a session after any prior `wa
+    sync`, which is the only one that matters for delivery to the
+    recipient's UI.
+    """
     import secrets
     import time as _time
 
     from wa.cache import CachedMessage, append_messages, upsert_chat
-    from wa.peerreq import _string_field, pad_for_signal
+    from wa.peerreq import pad_for_signal
 
     log = logging.getLogger("send")
-
-    # Message proto: a plain text message is `{conversation: text}`,
-    # which is field 1 (string) inside waE2E.Message. We hand-encode
-    # rather than vendor the .proto for this one field.
-    message_proto = _string_field(1, text)
-    padded = pad_for_signal(message_proto)
 
     peer_local, _, peer_server = peer_jid.partition("@")
     if not peer_server:
         click.echo(f"malformed peer JID: {peer_jid!r}", err=True)
         raise SystemExit(1)
 
-    # Encryption identity is normally the same as the wire-level address.
-    # Self-send is the exception: the active session with your own device
-    # is keyed under your LID, while the stanza is addressed to your PN
-    # (mirroring the pattern used for the on-demand history channel).
     own_pn = JID.parse(device.jid)
     own_lid = JID.parse(device.lid) if device.lid else None
-    is_self = peer_local == own_pn.user or (own_lid and peer_local == own_lid.user)
-    if is_self and own_lid is not None:
-        session_user = own_lid.user
+    own_self_device = own_pn.device  # this CLI's device number
+
+    # Resolve peer to PN + LID forms. For self-sends we use LID end-to-end
+    # (matching what the phone itself does on its outgoing flow); for
+    # peer sends we use PN addressing with LID encryption identity
+    # (matching whatsmeow's behavior for non-self recipients).
+    from wa.cache import load_lidmap
+
+    lidmap = load_lidmap()
+    if peer_server == "s.whatsapp.net":
+        peer_pn_jid = JID(user=peer_local, server="s.whatsapp.net")
+        peer_lid_user = next(
+            (lu for lu, pn in lidmap.items() if pn == str(peer_pn_jid)),
+            None,
+        )
+    elif peer_server == "lid":
+        peer_lid_user = peer_local
+        pn_str = lidmap.get(peer_local)
+        peer_pn_jid = JID.parse(pn_str) if pn_str else None
     else:
-        session_user = peer_local
+        click.echo(f"unsupported recipient server {peer_server!r}", err=True)
+        raise SystemExit(1)
+
+    is_self_send = (
+        peer_pn_jid is not None and peer_pn_jid.user == own_pn.user
+    ) or (own_lid is not None and peer_lid_user == own_lid.user)
+
+    if is_self_send and own_lid is not None:
+        # End-to-end LID addressing: query LID, encrypt under LID, address
+        # the stanza with LID. Mirrors what the phone does for self-sends.
+        wire_to = JID(user=own_lid.user, server="lid")
+        dsm_dest = str(wire_to)
+    elif peer_pn_jid is not None:
+        # Standard peer send: PN addressing, LID encryption identity.
+        wire_to = peer_pn_jid
+        dsm_dest = str(peer_pn_jid)
+    else:
+        click.echo(
+            click.style(
+                f"don't know the PN for {peer_jid} — only the LID is in lidmap.\n"
+                f"  hint: this happens when you've never been in a group with the "
+                f"peer (group participant lists carry both ids). For peer sends the "
+                f"CLI currently needs a known PN.",
+                fg="red",
+            ),
+            err=True,
+        )
+        raise SystemExit(1)
+
+    msg_plaintext = _build_message_plaintext(text)
+    dsm_plaintext = _build_dsm_plaintext(text, dsm_dest)
 
     async with FrameSocket() as fs:
         await fs.connect()
@@ -817,7 +1007,6 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
         except Exception as e:
             click.echo(click.style(f"handshake failed: {e}", fg="red"), err=True)
             raise SystemExit(1)
-        # Wait for <success/>.
         while True:
             try:
                 ct = await fs.recv(timeout=15.0)
@@ -828,11 +1017,12 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             if node.tag == "success":
                 break
             if node.tag == "failure":
-                click.echo(click.style(f"login rejected: {_pretty(node)}", fg="red"), err=True)
+                click.echo(
+                    click.style(f"login rejected: {_pretty(node)}", fg="red"),
+                    err=True,
+                )
                 raise SystemExit(1)
 
-        # Active IQ — needed so the server treats us as a live client and
-        # routes our outbound message instead of buffering it.
         active = Node(
             tag="iq",
             attrs={
@@ -854,49 +1044,130 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             if n.tag == "iq" and n.attrs.get("id") == "send-active":
                 break
 
-        # Encrypt to the peer's primary device (device 0). Throws if no
-        # session exists; surface a clear hint pointing at `wa sync`.
-        signal = SignalSession(device)
+        # For self-sends we query usync with our LID JID so the response
+        # is a list of LID-form devices — matching the LID-addressed
+        # stanza we'll build below. For peer sends, query PN.
+        if is_self_send and own_lid is not None:
+            queried = [JID(user=own_lid.user, server="lid")]
+        else:
+            queried = [peer_pn_jid]
+            if peer_pn_jid.user != own_pn.user:
+                queried.append(JID(user=own_pn.user, server="s.whatsapp.net"))
         try:
-            ciphertext, kind = signal.encrypt_msg(session_user, 0, padded)
+            all_devices = await _usync_devices(fs, ns, queried)
         except Exception as e:
+            click.echo(click.style(f"device list query failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+        if not all_devices:
             click.echo(
                 click.style(
-                    f"no Signal session with {session_user}:0 — {e}\n"
-                    f"  hint: run `wa sync` after the peer sends you anything "
-                    f"(messages, typing indicator, presence), then retry.",
+                    "no devices returned — peer may have no WhatsApp account",
                     fg="red",
                 ),
                 err=True,
             )
             raise SystemExit(1)
+        log.info("device list (PN form): %s", [str(d) for d in all_devices])
 
-        # WhatsApp outbound message IDs: uppercase hex, prefixed `3EB0`
-        # for client-generated. Server-side filtering drops off-format IDs.
+        signal = SignalSession(device)
+        participant_children: list[Node] = []
+        missing_sessions: list[str] = []
+        any_pkmsg = False
+        for dev in all_devices:
+            # "Own device" check: depends on which namespace we queried.
+            # For self-sends we queried LID, so all devices have user ==
+            # own_lid.user. For peer sends we queried PN.
+            if is_self_send:
+                is_own = own_lid is not None and dev.user == own_lid.user
+            else:
+                is_own = dev.user == own_pn.user
+            if is_own and dev.device == own_self_device:
+                continue
+            plaintext = dsm_plaintext if is_own else msg_plaintext
+            padded = pad_for_signal(plaintext)
+            # Encryption identity. For self-sends the device list IS
+            # already LID, so encrypt under dev.user directly. For peer
+            # sends, dev.user is PN; translate to the peer's LID local
+            # part (which is where active sessions are stored).
+            if is_self_send:
+                enc_user = dev.user
+            elif is_own and own_lid is not None:
+                enc_user = own_lid.user
+            elif (not is_own) and peer_lid_user is not None:
+                enc_user = peer_lid_user
+            else:
+                enc_user = dev.user
+            try:
+                ct, kind = signal.encrypt_msg(enc_user, dev.device, padded)
+            except Exception as e:
+                missing_sessions.append(f"{enc_user}:{dev.device}")
+                log.debug("no session with %s:%d (%s)", enc_user, dev.device, e)
+                continue
+            if kind == "pkmsg":
+                any_pkmsg = True
+            # Wire identity matches what we'll address the stanza with:
+            # LID for self-sends, PN for peer sends.
+            participant_children.append(
+                Node(
+                    tag="to",
+                    attrs={"jid": dev},
+                    content=[
+                        Node(tag="enc", attrs={"v": "2", "type": kind}, content=ct)
+                    ],
+                )
+            )
+        if not participant_children:
+            click.echo(
+                click.style(
+                    "no encryptable devices — every target lacked a Signal session.\n"
+                    "  hint: receive any message from the peer first (so their session "
+                    "is bootstrapped), then retry. Pre-key bundle fetch for "
+                    "first-contact sends is not yet implemented.",
+                    fg="red",
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
+        if missing_sessions:
+            log.warning(
+                "skipped %d device(s) with no session: %s",
+                len(missing_sessions), ", ".join(missing_sessions),
+            )
+
+        # The participant-list hash (`phash`) is computed for diagnostics
+        # but deliberately NOT placed on the DM stanza — whatsmeow only
+        # puts it on group sends, and including it on DMs makes the
+        # server quietly drop the message. Same for `addressing_mode`,
+        # which is a group-specific attribute.
         msg_id = "3EB0" + secrets.token_hex(9).upper()
-        # Stanza addressing: PN form when sending to self (matches the
-        # session-vs-address split above); otherwise the peer's JID as-is.
-        stanza_to = (
-            JID(user=own_pn.user, server="s.whatsapp.net")
-            if is_self
-            else JID(user=peer_local, server=peer_server)
-        )
+        content_nodes: list[Node] = [
+            Node(tag="participants", content=participant_children)
+        ]
+        if any_pkmsg and device.account:
+            # When any per-device `<enc>` was a pkmsg (first message in
+            # that session direction), the recipient needs our signed
+            # ADV identity to verify the prekey signal message. The blob
+            # is `ADVSignedDeviceIdentity`, captured during pairing.
+            content_nodes.append(
+                Node(tag="device-identity", content=device.account)
+            )
         stanza = Node(
             tag="message",
-            attrs={"to": stanza_to, "type": "text", "id": msg_id},
-            content=[
-                Node(tag="enc", attrs={"v": "2", "type": kind}, content=ciphertext),
-            ],
+            attrs={"to": wire_to, "type": "text", "id": msg_id},
+            content=content_nodes,
         )
         await fs.send(ns.encrypt_frame(encode_node(stanza)))
-        log.info("sent %s message id=%s to=%s (%d-byte enc)", kind, msg_id, peer_jid, len(ciphertext))
+        log.info(
+            "sent text id=%s to=%s participants=%d any_pkmsg=%s",
+            msg_id, wire_to, len(participant_children), any_pkmsg,
+        )
 
-        # Await ack. Server returns `<ack class="message" id="<msg_id>"/>`
-        # to confirm delivery to its queue.
         ack_deadline = asyncio.get_event_loop().time() + 15.0
         while asyncio.get_event_loop().time() < ack_deadline:
             try:
-                ct = await fs.recv(timeout=max(0.1, ack_deadline - asyncio.get_event_loop().time()))
+                ct = await fs.recv(
+                    timeout=max(0.1, ack_deadline - asyncio.get_event_loop().time())
+                )
             except (asyncio.TimeoutError, ConnectionError):
                 break
             try:
@@ -909,7 +1180,7 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
                     CachedMessage(
                         ts=ts,
                         chat=peer_jid,
-                        sender=f"{own_pn.user}@s.whatsapp.net",
+                        sender=str(own_pn) if own_pn.user else "",
                         sender_name="me",
                         text=text,
                         from_me=True,
