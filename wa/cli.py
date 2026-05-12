@@ -290,7 +290,21 @@ def chats(limit: int, json_out: bool) -> None:
     is_flag=True,
     help="Don't auto-fetch more history from your phone if the cache is short",
 )
-def read(query: str, limit: int, json_out: bool, no_extend: bool) -> None:
+@click.option(
+    "--match",
+    "match_index",
+    type=int,
+    default=None,
+    help="When the query is ambiguous, pick the Nth match (1-based) instead "
+    "of the first. Use after seeing the ambiguity list.",
+)
+def read(
+    query: str,
+    limit: int,
+    json_out: bool,
+    no_extend: bool,
+    match_index: int | None,
+) -> None:
     """Show recent messages from a chat (matched by name or JID substring).
 
     Auto-extends: if the local cache has fewer than ``--limit`` messages for
@@ -300,9 +314,11 @@ def read(query: str, limit: int, json_out: bool, no_extend: bool) -> None:
 
     \b
     Examples:
-      whatsapp_user_cli read famille
-      whatsapp_user_cli read 33687776779 --limit 50 --json
-      whatsapp_user_cli read famille --no-extend     # offline, fast
+      wa read famille
+      wa read 33687776779 --limit 50 --json
+      wa read famille --no-extend                 # offline, fast
+      wa read giannaros --match 2                 # pick 2nd of ambiguous matches
+      wa read 16677492244589@lid                  # exact JID — never ambiguous
     """
     from wa.cache import find_chat, iter_messages, load_chats, load_contacts, load_lidmap
 
@@ -310,15 +326,35 @@ def read(query: str, limit: int, json_out: bool, no_extend: bool) -> None:
     if not matches:
         click.echo(f"no chat matching {query!r}", err=True)
         raise SystemExit(1)
-    if len(matches) > 1 and not any(
+    exact_name = any(
         info.get("name", "").lower() == query.lower() for _, info in matches
-    ):
+    )
+    if match_index is not None:
+        if match_index < 1 or match_index > len(matches):
+            click.echo(
+                f"--match {match_index} out of range: {len(matches)} matches for {query!r}",
+                err=True,
+            )
+            raise SystemExit(1)
+        chat_jid, chat_info = matches[match_index - 1]
+    elif len(matches) > 1 and not exact_name:
+        # List every match (numbered) so the user can re-run with --match N
+        # or copy a full JID. Substring match against the JID also picks a
+        # single chat, so the message tells them both options.
+        lines = [
+            f"  [{i + 1}] {j}  {info.get('name') or ''}".rstrip()
+            for i, (j, info) in enumerate(matches)
+        ]
         click.echo(
             f"ambiguous: {len(matches)} chats match {query!r}. Showing first.\n"
-            + "\n".join(f"  {j}  {i.get('name')}" for j, i in matches[:5]),
+            + "\n".join(lines)
+            + "\n  → rerun with `--match N` or pass a full JID like "
+            + matches[1][0],
             err=True,
         )
-    chat_jid, chat_info = matches[0]
+        chat_jid, chat_info = matches[0]
+    else:
+        chat_jid, chat_info = matches[0]
 
     # Auto-extend: count cached messages for this chat; if short, fetch more.
     if not no_extend and limit > 0:
