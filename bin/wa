@@ -1,4 +1,4 @@
-#!/usr/bin/env -S uv run
+#!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -13,9 +13,10 @@
 # ///
 """Standalone launcher for the WhatsApp CLI.
 
-PEP 723 inline metadata makes ``./scripts/whatsapp_user_cli.py`` runnable
-directly via ``uv run`` without installing the package — useful for fresh
-checkouts and the linked-skill flow. The real CLI lives in ``wa.cli``.
+PEP 723 inline metadata makes ``bin/wa`` runnable directly via ``uv run``
+without installing the package — used both for fresh checkouts and for
+skill-bundle delivery (the SKILL.md tells agents to invoke this file
+relative to the skill root). The real CLI lives in ``wa.cli``.
 """
 
 from __future__ import annotations
