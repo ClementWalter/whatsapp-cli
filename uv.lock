@@ -900,23 +900,23 @@ test = [
 
 [package.metadata]
 requires-dist = [
-    { name = "aiohttp", specifier = ">=3.10" },
-    { name = "click", specifier = ">=8.1" },
-    { name = "cryptography", specifier = ">=43" },
-    { name = "protobuf", specifier = ">=5" },
-    { name = "pyobjc-framework-contacts", marker = "extra == 'macos'", specifier = ">=10" },
-    { name = "qrcode", extras = ["pil"], specifier = ">=7.4" },
-    { name = "signal-protocol", specifier = ">=0.2" },
+    { name = "aiohttp", specifier = "==3.13.5" },
+    { name = "click", specifier = "==8.3.3" },
+    { name = "cryptography", specifier = "==48.0.0" },
+    { name = "protobuf", specifier = "==7.34.1" },
+    { name = "pyobjc-framework-contacts", marker = "extra == 'macos'", specifier = "==12.1" },
+    { name = "qrcode", extras = ["pil"], specifier = "==8.2" },
+    { name = "signal-protocol", specifier = "==0.2.2" },
 ]
 provides-extras = ["macos"]
 
 [package.metadata.requires-dev]
 test = [
-    { name = "aiohttp", specifier = ">=3.10" },
-    { name = "cryptography", specifier = ">=43" },
-    { name = "protobuf", specifier = ">=5" },
-    { name = "pytest", specifier = ">=8" },
-    { name = "signal-protocol", specifier = ">=0.2" },
+    { name = "aiohttp", specifier = "==3.13.5" },
+    { name = "cryptography", specifier = "==48.0.0" },
+    { name = "protobuf", specifier = "==7.34.1" },
+    { name = "pytest", specifier = "==9.0.3" },
+    { name = "signal-protocol", specifier = "==0.2.2" },
 ]
 
 [[package]]

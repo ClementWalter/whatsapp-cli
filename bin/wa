@@ -1,14 +1,16 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
+# # Exact pins — match pyproject.toml. Supply-chain defense: a compromised
+# # new release can't sneak in via `>=` resolution. Bump deliberately.
 # dependencies = [
-#     "aiohttp>=3.10",
-#     "click>=8.1",
-#     "cryptography>=43",
-#     "protobuf>=5",
-#     "qrcode[pil]>=7.4",
-#     "signal-protocol>=0.2",
-#     "pyobjc-framework-Contacts>=10; sys_platform == 'darwin'",
+#     "aiohttp==3.13.5",
+#     "click==8.3.3",
+#     "cryptography==48.0.0",
+#     "protobuf==7.34.1",
+#     "qrcode[pil]==8.2",
+#     "signal-protocol==0.2.2",
+#     "pyobjc-framework-Contacts==12.1; sys_platform == 'darwin'",
 # ]
 # ///
 """Standalone launcher for the WhatsApp CLI.
