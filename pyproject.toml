@@ -17,7 +17,7 @@ dependencies = [
 macos = ["pyobjc-framework-Contacts>=10"]
 
 [project.scripts]
-wa = "scripts.whatsapp_user_cli:cli"
+wa = "wa.cli:cli"
 
 [dependency-groups]
 test = [
