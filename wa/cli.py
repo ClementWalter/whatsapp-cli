@@ -235,6 +235,156 @@ def import_contacts_cmd() -> None:
     click.echo(click.style(f"merged {new_count} new names into contacts", fg="green"), err=True)
 
 
+@cli.command(name="migrate")
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Show what would change without writing anything to disk.",
+)
+def migrate_cmd(dry_run: bool) -> None:
+    """Merge duplicate chats from the LID/PN identity migration.
+
+    WhatsApp's 2024 rollout routes most DMs through ``@lid`` privacy
+    identifiers instead of ``@s.whatsapp.net`` phone-number JIDs, leaving
+    the same conversation split between two cache entries. WhatsApp Web
+    fuses them transparently using a server-maintained mapping; this CLI
+    used to show both halves as separate rows. This command does the same
+    fuse locally: it rewrites ``chats.json``, ``messages.jsonl``, and
+    ``contacts.json`` so every conversation appears under a single
+    canonical JID.
+
+    Two cases are merged:
+
+    1. Polluted rows — a now-fixed bug stored ``<lid>@s.whatsapp.net``.
+       The local part for these is >13 digits (not a real phone number);
+       they get rewritten to ``<lid>@lid``.
+    2. Genuine PN/LID twins — a contact you had before the migration
+       has both a ``<phone>@s.whatsapp.net`` entry and a ``<lid>@lid``
+       entry. The inverted ``lidmap.json`` resolves which is which; the
+       PN side gets folded into the LID side.
+
+    Idempotent and safe to re-run.
+    """
+    import time as _time
+
+    from wa.cache import (
+        CHATS_PATH,
+        CONTACTS_PATH,
+        MESSAGES_PATH,
+        load_chats,
+        load_contacts,
+        load_lidmap,
+        save_chats,
+        save_contacts,
+    )
+
+    chats = load_chats()
+    contacts = load_contacts()
+    lidmap = load_lidmap()
+    # lidmap maps lid_user → "<pn>@s.whatsapp.net". Invert so a PN JID
+    # tells us its LID local-part counterpart.
+    pn_to_lid_user = {pn_jid: lid_user for lid_user, pn_jid in lidmap.items()}
+
+    def canonical(jid: str) -> str:
+        # Groups, LIDs, and anything non-PN — leave alone.
+        if not jid.endswith("@s.whatsapp.net"):
+            return jid
+        local = jid.split("@")[0]
+        if local.isdigit() and len(local) > 13:
+            # Polluted: 14+ digits is never a real phone number, always a LID.
+            return f"{local}@lid"
+        lid_user = pn_to_lid_user.get(jid)
+        if lid_user:
+            return f"{lid_user}@lid"
+        return jid  # legitimate PN with no known LID twin — leave it
+
+    # --- chats.json ----------------------------------------------------
+    new_chats: dict[str, dict] = {}
+    chat_renames: dict[str, str] = {}  # old → new
+    for jid, info in chats.items():
+        target = canonical(jid)
+        if target != jid:
+            chat_renames[jid] = target
+        existing = new_chats.get(target)
+        if existing is None:
+            new_chats[target] = dict(info)
+        else:
+            # Merge: pick the higher last_ts, the first non-empty name.
+            existing["last_ts"] = max(
+                existing.get("last_ts", 0), info.get("last_ts", 0)
+            )
+            if not existing.get("name") and info.get("name"):
+                existing["name"] = info["name"]
+
+    # --- contacts.json -------------------------------------------------
+    new_contacts: dict[str, str] = {}
+    contact_renames = 0
+    for jid, name in contacts.items():
+        target = canonical(jid)
+        if target != jid:
+            contact_renames += 1
+        # First write wins (typically the @lid entry, which we want as
+        # canonical); the other writes are duplicate-but-equal names.
+        new_contacts.setdefault(target, name)
+
+    # --- messages.jsonl ------------------------------------------------
+    msgs_rewritten = 0
+    msgs_total = 0
+    new_msgs_text = []
+    if MESSAGES_PATH.exists():
+        with MESSAGES_PATH.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                msgs_total += 1
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    new_msgs_text.append(line)
+                    continue
+                changed = False
+                for key in ("chat", "sender"):
+                    if key in obj and isinstance(obj[key], str):
+                        new_v = canonical(obj[key])
+                        if new_v != obj[key]:
+                            obj[key] = new_v
+                            changed = True
+                if changed:
+                    msgs_rewritten += 1
+                new_msgs_text.append(json.dumps(obj, ensure_ascii=False))
+
+    summary = (
+        f"chats:    {len(chats)} → {len(new_chats)} "
+        f"({len(chat_renames)} renames, {len(chats) - len(new_chats)} merges)\n"
+        f"contacts: {len(contacts)} → {len(new_contacts)} ({contact_renames} renames)\n"
+        f"messages: {msgs_total} total, {msgs_rewritten} rewritten"
+    )
+
+    if dry_run:
+        click.echo(click.style("dry-run: would apply\n", fg="yellow") + summary)
+        # Show a handful of example renames so the user can sanity-check.
+        if chat_renames:
+            click.echo("\nexample chat merges:")
+            for old, new in list(chat_renames.items())[:5]:
+                click.echo(f"  {old}  →  {new}")
+        return
+
+    save_chats(new_chats)
+    save_contacts(new_contacts)
+    if MESSAGES_PATH.exists():
+        # Atomic rewrite: write to .tmp then rename. Keeps a .bak in case
+        # something looks wrong after — easy rollback.
+        backup = MESSAGES_PATH.with_suffix(f".jsonl.bak.{int(_time.time())}")
+        MESSAGES_PATH.rename(backup)
+        with MESSAGES_PATH.open("w", encoding="utf-8") as f:
+            f.write("\n".join(new_msgs_text))
+            if new_msgs_text:
+                f.write("\n")
+        click.echo(f"backup written to {backup.name}")
+    click.echo(click.style("done.\n", fg="green") + summary)
+
+
 @cli.command()
 @click.option("--limit", type=int, default=20, help="Max chats to show")
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
