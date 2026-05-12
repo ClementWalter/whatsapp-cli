@@ -906,99 +906,165 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
     pair. This is the only way to populate names for contacts whose
     pushNames aren't in the global PUSH_NAME sync (typically because they
     haven't shared one publicly, but their group display still has one).
+
+    Two optimizations vs. a naive loop:
+
+    1. **TTL cache** (``group_fetches.json``). Groups queried in the last
+       ``WA_GROUPINFO_TTL_DAYS`` (default 7) are skipped — participant
+       lists are essentially static between explicit ``w:gp2``
+       notifications, so re-fetching them every login is pure waste.
+    2. **Pipelined IQs**. A single reader task demultiplexes replies by
+       ``iq_id``; up to ``WA_GROUPINFO_CONCURRENCY`` (default 10) requests
+       are in flight at once. With a typical ~150ms RTT the wall-clock
+       drops from ``N × 150ms`` to roughly ``N/10 × 150ms``.
     """
     import secrets
+    import time as _time
 
-    from wa.cache import load_chats, load_contacts, load_lidmap, save_contacts, save_lidmap
+    from wa.cache import (
+        load_chats,
+        load_contacts,
+        load_group_fetches,
+        load_lidmap,
+        save_contacts,
+        save_group_fetches,
+        save_lidmap,
+    )
 
     log = logging.getLogger("groupinfo")
     chats = load_chats()
     contacts = load_contacts()
     lidmap = load_lidmap()
-    # Sort groups by recent activity (last_ts desc) so the most relevant
-    # ones get queried first — useful when we cap the number per session.
+    fetches = load_group_fetches()
+    now_ts = int(_time.time())
+    ttl_days = float(os.environ.get("WA_GROUPINFO_TTL_DAYS", "7"))
+    ttl_seconds = int(ttl_days * 86400)
+    cap = int(os.environ.get("WA_GROUPINFO_CAP", "1000"))
+    concurrency = int(os.environ.get("WA_GROUPINFO_CONCURRENCY", "10"))
+
+    # Sort by recent activity so the most relevant groups go first when the
+    # cap bites. Then filter out anything fetched within TTL.
     groups_all = sorted(
         (j for j in chats if j.endswith("@g.us")),
         key=lambda j: chats[j].get("last_ts", 0),
         reverse=True,
     )
-    cap = int(os.environ.get("WA_GROUPINFO_CAP", "200"))
-    groups = groups_all[:cap]
+    skipped = sum(1 for g in groups_all if now_ts - fetches.get(g, 0) < ttl_seconds)
+    groups = [g for g in groups_all if now_ts - fetches.get(g, 0) >= ttl_seconds][:cap]
     log.info(
-        "fetching participant info for %d/%d groups (cap WA_GROUPINFO_CAP=%d)...",
-        len(groups), len(groups_all), cap,
+        "fetching %d groups (skipping %d cached <%.0fd old, concurrency=%d)",
+        len(groups), skipped, ttl_days, concurrency,
     )
-    new_count = 0
+    if not groups:
+        return
 
-    for gid_idx, gid in enumerate(groups):
-        iq_id = f"gi-{secrets.token_hex(4)}"
-        iq = Node(
-            tag="iq",
-            attrs={"to": JID.parse(gid), "type": "get", "id": iq_id, "xmlns": "w:g2"},
-            content=[Node(tag="query", attrs={"request": "interactive"})],
-        )
-        try:
-            await fs.send(ns.encrypt_frame(encode_node(iq)))
-        except Exception as e:
-            log.warning("send failed for %s: %s", gid, e)
-            continue
-        deadline = asyncio.get_event_loop().time() + 2.0  # short — most replies are <100ms
-        if gid_idx == 0:
-            log.debug("first group IQ sent: id=%s to=%s", iq_id, gid)
-        while asyncio.get_event_loop().time() < deadline:
+    pending: dict[str, asyncio.Future] = {}
+    new_count = 0
+    reader_stop = asyncio.Event()
+
+    async def reader() -> None:
+        # Dedicated frame reader: routes <iq> replies to their pending
+        # futures by id, drops anything else (no other phase is running).
+        while not reader_stop.is_set():
             try:
-                ct = await fs.recv(timeout=max(0.1, deadline - asyncio.get_event_loop().time()))
+                ct = await fs.recv(timeout=0.5)
             except (asyncio.TimeoutError, ConnectionError):
-                break
+                continue
             try:
                 node = decode_node(ns.decrypt_frame(ct))
             except Exception:
                 continue
-            if gid_idx == 0:
-                log.debug(
-                    "first-group recv: tag=%s id=%s type=%s",
-                    node.tag, node.attrs.get("id"), node.attrs.get("type"),
-                )
-            if node.tag != "iq" or node.attrs.get("id") != iq_id:
+            if node.tag != "iq":
                 continue
-            if gid_idx == 0:
-                log.debug("first-group reply matched! body:\n%s", _pretty(node))
+            iq_id = node.attrs.get("id")
+            fut = pending.get(iq_id)
+            if fut is not None and not fut.done():
+                fut.set_result(node)
+
+    def _harvest(node: Node) -> int:
+        nonlocal new_count
+        added = 0
+        grp = node.get_child_by_tag("group")
+        if grp is None:
+            return 0
+        for child in grp.get_children():
+            if child.tag != "participant":
+                continue
+            disp = child.attrs.get("display_name", "")
+            pjid = child.attrs.get("jid")
+            pn_attr = child.attrs.get("phone_number")
+            if not disp or not isinstance(pjid, JID):
+                continue
+            lid_key = f"{pjid.user}@lid" if pjid.server == "lid" else None
+            pn_key = None
+            if isinstance(pn_attr, JID) and pn_attr.user:
+                pn_key = f"{pn_attr.user}@s.whatsapp.net"
+            elif pjid.server == "s.whatsapp.net":
+                pn_key = f"{pjid.user}@s.whatsapp.net"
+            for k in (lid_key, pn_key):
+                if k and contacts.get(k) != disp:
+                    contacts[k] = disp
+                    added += 1
+            if lid_key and pn_key and lidmap.get(pjid.user) != pn_key:
+                lidmap[pjid.user] = pn_key
+        new_count += added
+        return added
+
+    sem = asyncio.Semaphore(concurrency)
+
+    async def fetch_one(gid: str) -> None:
+        async with sem:
+            iq_id = f"gi-{secrets.token_hex(4)}"
+            fut: asyncio.Future = asyncio.get_event_loop().create_future()
+            pending[iq_id] = fut
+            iq = Node(
+                tag="iq",
+                attrs={"to": JID.parse(gid), "type": "get", "id": iq_id, "xmlns": "w:g2"},
+                content=[Node(tag="query", attrs={"request": "interactive"})],
+            )
+            try:
+                await fs.send(ns.encrypt_frame(encode_node(iq)))
+            except Exception as e:
+                log.warning("send failed for %s: %s", gid, e)
+                pending.pop(iq_id, None)
+                return
+            try:
+                node = await asyncio.wait_for(fut, timeout=5.0)
+            except asyncio.TimeoutError:
+                log.debug("group %s: no reply in 5s, skipping", gid)
+                return
+            finally:
+                pending.pop(iq_id, None)
+            # Cache the fetch attempt regardless of outcome: an `<iq type="error">`
+            # ("not-authorized" / "item-not-found") means you've left the group
+            # or it no longer exists, and that state is very unlikely to flip
+            # back during the TTL window. Re-querying every login is exactly
+            # the waste we're trying to eliminate.
+            fetches[gid] = int(_time.time())
             if node.attrs.get("type") == "error":
                 err = node.get_child_by_tag("error")
                 log.debug("group %s: error %s", gid, err.attrs if err else "?")
-                break
-            grp = node.get_child_by_tag("group")
-            if grp is None:
-                break
-            for child in grp.get_children():
-                if child.tag != "participant":
-                    continue
-                disp = child.attrs.get("display_name", "")
-                pjid = child.attrs.get("jid")
-                pn_attr = child.attrs.get("phone_number")
-                if not disp or not isinstance(pjid, JID):
-                    continue
-                lid_key = f"{pjid.user}@lid" if pjid.server == "lid" else None
-                pn_key = None
-                if isinstance(pn_attr, JID) and pn_attr.user:
-                    pn_key = f"{pn_attr.user}@s.whatsapp.net"
-                elif pjid.server == "s.whatsapp.net":
-                    pn_key = f"{pjid.user}@s.whatsapp.net"
-                # Persist all three lookups so resolve() finds the name
-                # via any of contacts[lid] / contacts[pn] / lidmap[lid_local].
-                for k in (lid_key, pn_key):
-                    if k and contacts.get(k) != disp:
-                        contacts[k] = disp
-                        new_count += 1
-                if lid_key and pn_key and lidmap.get(pjid.user) != pn_key:
-                    lidmap[pjid.user] = pn_key
-            break  # done with this group
-        # tiny pause between groups so we don't hammer the server
-        await asyncio.sleep(0.05)
+                return
+            _harvest(node)
+
+    reader_task = asyncio.create_task(reader())
+    try:
+        await asyncio.gather(*(fetch_one(g) for g in groups), return_exceptions=True)
+    finally:
+        reader_stop.set()
+        reader_task.cancel()
+        try:
+            await reader_task
+        except (asyncio.CancelledError, Exception):
+            pass
 
     save_contacts(contacts)
     save_lidmap(lidmap)
-    log.info("groupinfo added %d display_name entries", new_count)
+    save_group_fetches(fetches)
+    log.info(
+        "groupinfo: %d display_name entries from %d groups",
+        new_count, len(groups),
+    )
 
 
 async def _fetch_pushnames(fs: FrameSocket, ns) -> None:

@@ -28,6 +28,7 @@ MESSAGES_PATH = CACHE_DIR / "messages.jsonl"
 CHATS_PATH = CACHE_DIR / "chats.json"
 CONTACTS_PATH = CACHE_DIR / "contacts.json"
 LIDMAP_PATH = CACHE_DIR / "lidmap.json"
+GROUP_FETCHES_PATH = CACHE_DIR / "group_fetches.json"
 
 
 @dataclass
@@ -86,6 +87,21 @@ def load_lidmap() -> dict[str, str]:
 
 def save_lidmap(lidmap: dict[str, str]) -> None:
     _atomic_write_json(LIDMAP_PATH, lidmap)
+
+
+def load_group_fetches() -> dict[str, int]:
+    """``group_jid → unix_ts`` of the last successful participant-list fetch.
+
+    Lets the login post-success step skip groups it recently queried,
+    cutting wall-clock time on warm reconnects from ~38s to ~0s.
+    """
+    if not GROUP_FETCHES_PATH.exists():
+        return {}
+    return json.loads(GROUP_FETCHES_PATH.read_text())
+
+
+def save_group_fetches(fetches: dict[str, int]) -> None:
+    _atomic_write_json(GROUP_FETCHES_PATH, fetches)
 
 
 def append_messages(messages: list[CachedMessage]) -> None:
