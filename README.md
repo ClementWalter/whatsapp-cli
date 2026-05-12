@@ -40,10 +40,14 @@ uv tool install --from ./whatsapp-cli whatsapp-cli
 wa login
 ```
 
-State lives under `~/.config/whatsapp-user-cli/` (keys) and
-`~/.cache/whatsapp-user-cli/` (chats, contacts, message history). To
+State lives under `~/.config/whatsapp-cli/` (keys) and
+`~/.cache/whatsapp-cli/` (chats, contacts, message history). To
 uninstall cleanly, `uv tool uninstall whatsapp-cli` and `rm -rf` both
 directories.
+
+(If you previously ran a version that stored state under
+`~/.config/whatsapp-user-cli/`, the CLI auto-renames those directories
+on first import — your pairing is preserved.)
 
 ## Daily usage
 
@@ -53,7 +57,7 @@ wa chats                             # 20 most-recent conversations
 wa chats --limit 200 --json          # everything, machine-readable
 wa read "alice"                      # show alice's thread; auto-fetches more if cache is short
 wa read "alice" --match 2            # disambiguate when multiple "alices" match
-wa read 33687776779@s.whatsapp.net   # exact JID, never ambiguous
+wa read 33123456789@s.whatsapp.net   # exact JID, never ambiguous
 wa send "alice" "running 10 min late"
 wa send "Football" "see you at 7pm"  # groups work too
 wa import-contacts                   # macOS only: pull names from Contacts.app
@@ -71,14 +75,13 @@ both at the project root. The skill is published in the
 YAML frontmatter + markdown body that the `npx skills` CLI installs, and
 the same layout other agentic systems consume.
 
-### Install via `npx skills` (once the repo is on GitHub)
+### Install via `npx skills`
 
 ```bash
-# Replace <owner>/<repo> with the repo you publish to.
-npx skills add <owner>/<repo>
+npx skills add ClementWalter/whatsapp-cli
 ```
 
-This drops the skill under `~/.agents/skills/whatsapp-user-cli/` and
+This drops the skill under `~/.agents/skills/whatsapp-cli/` and
 symlinks it into every supported agent runtime that's installed on your
 machine (Claude Code, Cursor, Windsurf, Codex, Gemini CLI, …). Agents
 then drive the CLI by invoking the bundled `bin/wa` script directly.
@@ -88,10 +91,10 @@ then drive the CLI by invoking the bundled `bin/wa` script directly.
 ```bash
 # Option 1 — symlink so the skill picks up live edits.
 mkdir -p ~/.claude/skills
-ln -s "$(pwd)" ~/.claude/skills/whatsapp-user-cli
+ln -s "$(pwd)" ~/.claude/skills/whatsapp-cli
 
 # Option 2 — copy a frozen snapshot.
-cp -R . ~/.claude/skills/whatsapp-user-cli
+cp -R . ~/.claude/skills/whatsapp-cli
 ```
 
 Either way, agents that scan `~/.claude/skills/` (or

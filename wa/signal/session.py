@@ -10,8 +10,8 @@ Responsibilities:
 - Persist and reload Signal state (sessions, pre-keys) across runs so the
   ratchet is durable.
 
-Session state lives in ``~/.config/whatsapp-user-cli/signal.json``. Each
-session is keyed by ``user:device`` (e.g. ``33629442167:0``), matching the
+Session state lives in ``~/.config/whatsapp-cli/signal.json``. Each
+session is keyed by ``user:device`` (e.g. ``33123456789:0``), matching the
 address libsignal uses for its ProtocolAddress.
 """
 

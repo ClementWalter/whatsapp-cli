@@ -1,6 +1,6 @@
 """On-disk cache of chats, contacts, and messages.
 
-Layout under ``~/.cache/whatsapp-user-cli/store/``:
+Layout under ``~/.cache/whatsapp-cli/store/``:
 
 - ``chats.json``     — { jid: {name, last_ts, unread, archived} }
 - ``contacts.json``  — { jid: push_name }
@@ -23,8 +23,18 @@ from typing import Iterator
 
 log = logging.getLogger(__name__)
 
-CACHE_DIR = Path.home() / ".cache" / "whatsapp-user-cli" / "store"
-LOCK_PATH = Path.home() / ".cache" / "whatsapp-user-cli" / ".connection.lock"
+_LEGACY_CACHE_ROOT = Path.home() / ".cache" / "whatsapp-user-cli"
+_CACHE_ROOT = Path.home() / ".cache" / "whatsapp-cli"
+# Pre-publish naming was inconsistent: the skill name was `whatsapp-user-cli`
+# while the project, repo, and `pyproject.toml` were already `whatsapp-cli`.
+# Existing users have state under the old path — rename in place so we don't
+# orphan their pairing keys and cached chats. Idempotent: only runs if the
+# old directory exists and the new one doesn't.
+if _LEGACY_CACHE_ROOT.exists() and not _CACHE_ROOT.exists():
+    _LEGACY_CACHE_ROOT.rename(_CACHE_ROOT)
+
+CACHE_DIR = _CACHE_ROOT / "store"
+LOCK_PATH = _CACHE_ROOT / ".connection.lock"
 MESSAGES_PATH = CACHE_DIR / "messages.jsonl"
 CHATS_PATH = CACHE_DIR / "chats.json"
 CONTACTS_PATH = CACHE_DIR / "contacts.json"

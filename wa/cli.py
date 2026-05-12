@@ -78,7 +78,7 @@ def cli(ctx: click.Context, debug: bool) -> None:
 def ingest(download: bool) -> None:
     """Process saved HistorySyncNotification blobs into the local cache.
 
-    Walks ``~/.cache/whatsapp-user-cli/blobs/*-protocolMessage-*.bin`` and
+    Walks ``~/.cache/whatsapp-cli/blobs/*-protocolMessage-*.bin`` and
     extracts conversations, pushnames, and messages into ``store/`` as
     JSON / JSONL. Run this once after a fresh ``login`` got the bootstrap
     history, then read any chat with the ``read`` command.
@@ -102,7 +102,7 @@ def ingest(download: bool) -> None:
         parse_history_sync,
     )
 
-    blob_dir = Path.home() / ".cache" / "whatsapp-user-cli" / "blobs"
+    blob_dir = Path.home() / ".cache" / "whatsapp-cli" / "blobs"
     pm_files = sorted(blob_dir.glob("*-protocolMessage-*.bin"))
     if not pm_files:
         click.echo(f"no protocolMessage blobs in {blob_dir}", err=True)
@@ -452,9 +452,9 @@ def read(
     \b
     Examples:
       wa read famille
-      wa read 33687776779 --limit 50 --json
+      wa read 33123456789 --limit 50 --json
       wa read famille --no-extend                 # offline, fast
-      wa read giannaros --match 2                 # pick 2nd of ambiguous matches
+      wa read alice --match 2                     # pick 2nd of ambiguous matches
       wa read 16677492244589@lid                  # exact JID — never ambiguous
     """
     from wa.cache import find_chat, iter_messages, load_chats, load_contacts, load_lidmap
@@ -738,20 +738,13 @@ def send(peer: str, text: str) -> None:
     """Send a text message to a 1:1 chat.
 
     ``peer`` is a name (resolved against your cached chats, same matcher
-    as ``wa read``) or a full JID like ``33629442167@s.whatsapp.net``.
-    The recipient's primary device is targeted; multi-device fan-out
-    (delivering to the recipient's Web/desktop clients as well) is not
-    yet implemented, but for normal phone-to-phone chats that's not what
-    you observe — the recipient's phone receives and rebroadcasts.
-
-    Requires an existing Signal session with the peer. After a `wa sync`
-    you'll have sessions with everyone you've recently exchanged
-    messages with. For first-contact sends, pre-key bundle fetch is not
-    yet wired up.
+    as ``wa read``) or a full JID like ``33123456789@s.whatsapp.net``.
+    For first-contact sends, pre-key bundle fetch is wired up — no setup
+    required as long as you've authenticated.
 
     \b
     Examples:
-      wa send 33629442167@s.whatsapp.net "test from CLI"
+      wa send 33123456789@s.whatsapp.net "test from CLI"
       wa send pierre "hi"
     """
     dev = Device.load()
@@ -2116,7 +2109,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                         continue
                     if f != 12 and len(v) < 1024:
                         continue  # skip small non-protocol blobs
-                    dump_dir = Path.home() / ".cache" / "whatsapp-user-cli" / "blobs"
+                    dump_dir = Path.home() / ".cache" / "whatsapp-cli" / "blobs"
                     dump_dir.mkdir(parents=True, exist_ok=True)
                     name = _FIELD_NAMES.get(f, f"field{f}")
                     import time as _time
@@ -2837,7 +2830,7 @@ async def _extend_chat(chat_jid: str, count: int) -> int:
 
 
 def _count_blob_files() -> int:
-    p = Path.home() / ".cache" / "whatsapp-user-cli" / "blobs"
+    p = Path.home() / ".cache" / "whatsapp-cli" / "blobs"
     if not p.exists():
         return 0
     return sum(1 for _ in p.iterdir() if _.is_file())

@@ -2,7 +2,7 @@
 
 Mirrors the subset of whatsmeow/store.Device needed for pairing +
 subsequent logins. Stored as JSON at
-``~/.config/whatsapp-user-cli/device.json`` by default (chmod 600).
+``~/.config/whatsapp-cli/device.json`` by default (chmod 600).
 
 The three-secret core is:
 
@@ -30,7 +30,18 @@ from typing import Any
 from wa.crypto.noise import x25519_generate, x25519_public
 from wa.crypto.xeddsa import _mont_x_to_ed_y  # noqa: F401 (exercised indirectly)
 
-DEFAULT_CONFIG_DIR = Path(os.environ.get("WA_CLI_HOME", "~/.config/whatsapp-user-cli")).expanduser()
+_LEGACY_CONFIG_DIR = Path("~/.config/whatsapp-user-cli").expanduser()
+_DEFAULT_CONFIG_DIR_RAW = os.environ.get("WA_CLI_HOME", "~/.config/whatsapp-cli")
+DEFAULT_CONFIG_DIR = Path(_DEFAULT_CONFIG_DIR_RAW).expanduser()
+# Pre-publish naming inconsistency: state used to live under
+# `~/.config/whatsapp-user-cli/`. Rename to the canonical location on first
+# import so existing users keep their pairing. Idempotent.
+if (
+    _LEGACY_CONFIG_DIR.exists()
+    and not DEFAULT_CONFIG_DIR.exists()
+    and DEFAULT_CONFIG_DIR == Path("~/.config/whatsapp-cli").expanduser()
+):
+    _LEGACY_CONFIG_DIR.rename(DEFAULT_CONFIG_DIR)
 DEFAULT_DEVICE_PATH = DEFAULT_CONFIG_DIR / "device.json"
 
 

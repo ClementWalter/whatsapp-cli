@@ -1,5 +1,5 @@
 ---
-name: whatsapp-user-cli
+name: whatsapp-cli
 description: "Read and write your own WhatsApp chats from the terminal via the bundled `bin/wa` command. Pairs as a linked device (one-time QR scan); then `bin/wa sync` catches up the offline queue, `bin/wa chats` lists conversations, `bin/wa read <name>` shows a thread, `bin/wa send <peer> \"<text>\"` sends a 1:1 or group message (text only). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
 ---
 
@@ -42,14 +42,14 @@ bin/wa login
 
 # Verify.
 bin/wa status
-# → paired as 33629442167:23@s.whatsapp.net (...) on iphone
+# → paired as 33123456789:23@s.whatsapp.net (...) on iphone
 #   last sync: 2026-05-12 16:40 (3m ago, 119 frames)
 ```
 
 State lives in:
-- `~/.config/whatsapp-user-cli/device.json` — pairing keys (keep private)
-- `~/.config/whatsapp-user-cli/signal.json` — Signal ratchet + sender keys
-- `~/.cache/whatsapp-user-cli/store/` — chats, contacts, messages cache
+- `~/.config/whatsapp-cli/device.json` — pairing keys (keep private)
+- `~/.config/whatsapp-cli/signal.json` — Signal ratchet + sender keys
+- `~/.cache/whatsapp-cli/store/` — chats, contacts, messages cache
 
 ## Commands
 
@@ -75,8 +75,8 @@ bin/wa sync --seconds 300    # bigger cap after weeks offline
 List conversations sorted by most recent activity. Default limit 20.
 
 ```
-2026-05-12  dm     Ariane Giannaros    16677492244589@lid
-2026-05-12  group  Football            120363166014203991@g.us
+2026-05-12  dm     Alice               123456789012345@lid
+2026-05-12  group  Football            123456789012345678@g.us
 …
 ```
 
@@ -92,7 +92,7 @@ queries print a numbered list — pick with `--match N` or pass a full JID.
 ```bash
 bin/wa read alice                   # most likely match
 bin/wa read alice --match 2         # pick the 2nd ambiguous match
-bin/wa read 16677492244589@lid      # exact JID, never ambiguous
+bin/wa read 123456789012345@lid     # exact JID, never ambiguous
 bin/wa read famille --limit 100     # bigger window
 bin/wa read alice --no-extend       # offline, cached only — no network
 bin/wa read alice --json            # machine-readable
@@ -107,7 +107,7 @@ a full JID. Supports 1:1 and group sends.
 
 ```bash
 bin/wa send "Pierre" "running late"
-bin/wa send 33629442167@s.whatsapp.net "test"     # self-send
+bin/wa send 33123456789@s.whatsapp.net "test"     # self-send
 bin/wa send "Football" "see you at 7pm"           # group (Sender Keys)
 ```
 

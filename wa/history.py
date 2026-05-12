@@ -245,9 +245,9 @@ def iter_conversation_messages(conv_bytes: bytes) -> Iterable[HistoryMessage]:
 
         text = ""
         if 2 in wmi and isinstance(wmi[2][0], (bytes, bytearray)):
-            # Local import sidesteps a circular import with the entry script
-            # (it imports from this module too).
-            from scripts.whatsapp_user_cli import _extract_text
+            # Local import sidesteps a circular import: wa.cli imports from
+            # this module, and we need its `_extract_text` helper here.
+            from wa.cli import _extract_text
 
             text = _extract_text(bytes(wmi[2][0]))
 
