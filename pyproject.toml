@@ -3,29 +3,33 @@ name = "whatsapp-cli"
 version = "0.1.0"
 description = "Pure-Python WhatsApp Web client with CLI; reads personal chats via linked-device pairing."
 requires-python = ">=3.11"
+# Exact-pinned to defend against supply-chain attacks: a compromised
+# new release on PyPI can't sneak in via `>=` resolution. `uv.lock`
+# holds matching hashes for the install side. Upgrade by bumping a
+# pin here and re-running `uv lock`.
 dependencies = [
-    "aiohttp>=3.10",
-    "click>=8.1",
-    "cryptography>=43",
-    "protobuf>=5",
-    "qrcode[pil]>=7.4",
-    "signal-protocol>=0.2",
+    "aiohttp==3.13.5",
+    "click==8.3.3",
+    "cryptography==48.0.0",
+    "protobuf==7.34.1",
+    "qrcode[pil]==8.2",
+    "signal-protocol==0.2.2",
 ]
 
 [project.optional-dependencies]
 # macOS-only — the import-contacts subcommand reads Contacts.app via PyObjC.
-macos = ["pyobjc-framework-Contacts>=10"]
+macos = ["pyobjc-framework-Contacts==12.1"]
 
 [project.scripts]
 wa = "wa.cli:cli"
 
 [dependency-groups]
 test = [
-    "pytest>=8",
-    "aiohttp>=3.10",
-    "cryptography>=43",
-    "protobuf>=5",
-    "signal-protocol>=0.2",
+    "pytest==9.0.3",
+    "aiohttp==3.13.5",
+    "cryptography==48.0.0",
+    "protobuf==7.34.1",
+    "signal-protocol==0.2.2",
 ]
 
 [tool.pytest.ini_options]
