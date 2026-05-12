@@ -19,24 +19,31 @@ LtHash-verified app-state sync for chat metadata.
 
 Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 
+Two ways:
+
+**A — Bundled launcher.** No install step. Clone the repo and invoke
+`bin/wa` directly; the `#!/usr/bin/env -S uv run --script` shebang and
+PEP 723 inline metadata make `uv` pull deps on the first run.
+
 ```bash
-# Clone and install as a user-wide tool. Pulls in deps (aiohttp, cryptography,
-# protobuf, signal-protocol, click, qrcode, pyobjc-framework-Contacts on macOS).
 git clone <repo> whatsapp-cli
+cd whatsapp-cli
+./bin/wa login                          # pair (one-time QR scan)
+./bin/wa status
+```
+
+**B — Global tool install.** Puts a `wa` command on PATH; the rest of
+the docs use that shorter form interchangeably with `bin/wa`.
+
+```bash
 uv tool install --from ./whatsapp-cli whatsapp-cli
-
-# Pair: scan the QR code with your phone (WhatsApp → Linked Devices → Link a Device).
 wa login
-
-# Verify.
-wa status
-# → paired as 33629442167:23@s.whatsapp.net (?) on iphone
-#   last sync: 2026-05-12 17:21 (5s ago, 22 frames)
 ```
 
 State lives under `~/.config/whatsapp-user-cli/` (keys) and
-`~/.cache/whatsapp-user-cli/` (chats, contacts, message history). To uninstall
-cleanly, `uv tool uninstall whatsapp-cli` and `rm -rf` both directories.
+`~/.cache/whatsapp-user-cli/` (chats, contacts, message history). To
+uninstall cleanly, `uv tool uninstall whatsapp-cli` and `rm -rf` both
+directories.
 
 ## Daily usage
 
@@ -58,24 +65,42 @@ including `--json`, `--limit`, `--seconds`, `--idle`, `--refresh-groups`,
 
 ## Use as an LLM skill
 
-The repo ships with a `SKILL.md` that documents the commands in a form an LLM
-agent can drive. Install it as a Claude Code skill (works with any tool that
-follows the `~/.claude/skills/<name>/SKILL.md` convention, including the
-`npx`-style skill loaders):
+The repo ships with a `SKILL.md` and a self-contained launcher at `bin/wa`,
+both at the project root. The skill is published in the
+[Vercel Labs `skills`](https://github.com/vercel-labs/skills) format — same
+YAML frontmatter + markdown body that the `npx skills` CLI installs, and
+the same layout other agentic systems consume.
+
+### Install via `npx skills` (once the repo is on GitHub)
 
 ```bash
-# Symlink for local development — the skill picks up your latest edits.
+# Replace <owner>/<repo> with the repo you publish to.
+npx skills add <owner>/<repo>
+```
+
+This drops the skill under `~/.agents/skills/whatsapp-user-cli/` and
+symlinks it into every supported agent runtime that's installed on your
+machine (Claude Code, Cursor, Windsurf, Codex, Gemini CLI, …). Agents
+then drive the CLI by invoking the bundled `bin/wa` script directly.
+
+### Install locally (development / unpublished)
+
+```bash
+# Option 1 — symlink so the skill picks up live edits.
 mkdir -p ~/.claude/skills
 ln -s "$(pwd)" ~/.claude/skills/whatsapp-user-cli
 
-# OR copy if you prefer a frozen snapshot.
+# Option 2 — copy a frozen snapshot.
 cp -R . ~/.claude/skills/whatsapp-user-cli
 ```
 
-The skill is then available to any LLM agent that scans `~/.claude/skills/`.
-Trigger phrases include "send a WhatsApp message", "read my WhatsApp chats",
-"catch me up on WhatsApp". Inside the agent the surface is exactly `wa <cmd>`
-— there's no separate API layer.
+Either way, agents that scan `~/.claude/skills/` (or
+`~/.agents/skills/`) will load `SKILL.md` and resolve commands against
+the sibling `bin/wa` launcher. No separate `uv tool install` needed —
+`bin/wa` is self-contained via PEP 723.
+
+Trigger phrases include "send a WhatsApp message", "read my WhatsApp
+chats", "catch me up on WhatsApp".
 
 ## Development
 
@@ -87,7 +112,7 @@ cd tools/oracle && go build -o oracle .
 uv run --group test pytest tests/ -v
 
 # Iterate without reinstalling — PEP 723 launcher pulls deps inline.
-./scripts/whatsapp_user_cli.py chats
+./bin/wa chats
 
 # After editing source, reinstall the console script.
 # (`--reinstall` is required: uv sees the version unchanged and won't rebuild
