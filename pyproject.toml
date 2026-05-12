@@ -1,0 +1,33 @@
+[project]
+name = "whatsapp-cli"
+version = "0.1.0"
+description = "Pure-Python WhatsApp Web client with CLI; reads personal chats via linked-device pairing."
+requires-python = ">=3.11"
+dependencies = [
+    "aiohttp>=3.10",
+    "click>=8.1",
+    "cryptography>=43",
+    "protobuf>=5",
+    "qrcode[pil]>=7.4",
+    "signal-protocol>=0.2",
+]
+
+[project.optional-dependencies]
+# macOS-only — the import-contacts subcommand reads Contacts.app via PyObjC.
+macos = ["pyobjc-framework-Contacts>=10"]
+
+[project.scripts]
+wa = "scripts.whatsapp_user_cli:cli"
+
+[dependency-groups]
+test = [
+    "pytest>=8",
+    "aiohttp>=3.10",
+    "cryptography>=43",
+    "protobuf>=5",
+    "signal-protocol>=0.2",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
