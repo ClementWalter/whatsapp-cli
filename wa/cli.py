@@ -1380,11 +1380,17 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             except Exception:
                 continue
             if node.tag == "ack" and node.attrs.get("id") == msg_id:
+                # Canonicalize before persisting: a user-typed peer JID
+                # may be in PN form even when canonical form is @lid.
+                # Without this we'd write a duplicate row in chats.json.
+                from wa.cache import canonical_jid
+
+                cache_jid = canonical_jid(peer_jid)
                 ts = int(_time.time())
                 append_messages([
                     CachedMessage(
                         ts=ts,
-                        chat=peer_jid,
+                        chat=cache_jid,
                         sender=str(own_pn) if own_pn.user else "",
                         sender_name="me",
                         text=text,
@@ -1392,7 +1398,7 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
                         msg_id=msg_id,
                     )
                 ])
-                upsert_chat(peer_jid, last_ts=ts)
+                upsert_chat(cache_jid, last_ts=ts)
                 click.echo(click.style(f"sent: {msg_id}", fg="green"))
                 return
             log.debug("ignoring frame while waiting for ack: %s", node.tag)
@@ -2109,7 +2115,9 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                     log.debug("saved %d-byte %s → %s", len(v), name, p.name)
 
 
-async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
+async def _fetch_group_participants(
+    fs: FrameSocket, ns, *, only_unnamed: bool = False
+) -> None:
     """For every cached group, query its metadata and harvest display names.
 
     Each ``<participant display_name="…" jid="<lid>" phone_number="<pn>">``
@@ -2128,6 +2136,12 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
        ``iq_id``; up to ``WA_GROUPINFO_CONCURRENCY`` (default 10) requests
        are in flight at once. With a typical ~150ms RTT the wall-clock
        drops from ``N × 150ms`` to roughly ``N/10 × 150ms``.
+
+    With ``only_unnamed=True`` the function targets just groups whose
+    ``chats.json`` entry has an empty ``name`` (newly-joined groups whose
+    subject we've never resolved), and ignores the TTL cache so they're
+    always fetched. Called from ``wa sync`` to keep names current
+    without the full ~5s refresh.
     """
     import secrets
     import time as _time
@@ -2137,6 +2151,7 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
         load_contacts,
         load_group_fetches,
         load_lidmap,
+        save_chats,
         save_contacts,
         save_group_fetches,
         save_lidmap,
@@ -2154,18 +2169,30 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
     concurrency = int(os.environ.get("WA_GROUPINFO_CONCURRENCY", "10"))
 
     # Sort by recent activity so the most relevant groups go first when the
-    # cap bites. Then filter out anything fetched within TTL.
+    # cap bites. Then filter to either (a) unnamed groups regardless of
+    # TTL, or (b) groups beyond the TTL window for the full refresh.
     groups_all = sorted(
         (j for j in chats if j.endswith("@g.us")),
         key=lambda j: chats[j].get("last_ts", 0),
         reverse=True,
     )
-    skipped = sum(1 for g in groups_all if now_ts - fetches.get(g, 0) < ttl_seconds)
-    groups = [g for g in groups_all if now_ts - fetches.get(g, 0) >= ttl_seconds][:cap]
-    log.info(
-        "fetching %d groups (skipping %d cached <%.0fd old, concurrency=%d)",
-        len(groups), skipped, ttl_days, concurrency,
-    )
+    if only_unnamed:
+        groups = [g for g in groups_all if not chats[g].get("name")][:cap]
+        log.info(
+            "fetching %d newly-joined groups (no name yet, concurrency=%d)",
+            len(groups), concurrency,
+        )
+    else:
+        skipped = sum(
+            1 for g in groups_all if now_ts - fetches.get(g, 0) < ttl_seconds
+        )
+        groups = [
+            g for g in groups_all if now_ts - fetches.get(g, 0) >= ttl_seconds
+        ][:cap]
+        log.info(
+            "fetching %d groups (skipping %d cached <%.0fd old, concurrency=%d)",
+            len(groups), skipped, ttl_days, concurrency,
+        )
     if not groups:
         return
 
@@ -2192,12 +2219,21 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
             if fut is not None and not fut.done():
                 fut.set_result(node)
 
-    def _harvest(node: Node) -> int:
+    def _harvest(gid: str, node: Node) -> int:
         nonlocal new_count
         added = 0
         grp = node.get_child_by_tag("group")
         if grp is None:
             return 0
+        # The group's own display name (subject) lives on the <group> tag.
+        # Persist it to chats.json so `wa chats` stops showing `(unnamed)`
+        # for newly-joined groups.
+        subject = grp.attrs.get("subject", "")
+        if subject and chats.get(gid, {}).get("name") != subject:
+            entry = chats.get(gid, {})
+            entry["name"] = subject
+            entry.setdefault("last_ts", 0)
+            chats[gid] = entry
         for child in grp.get_children():
             if child.tag != "participant":
                 continue
@@ -2256,7 +2292,7 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
                 err = node.get_child_by_tag("error")
                 log.debug("group %s: error %s", gid, err.attrs if err else "?")
                 return
-            _harvest(node)
+            _harvest(gid, node)
 
     reader_task = asyncio.create_task(reader())
     try:
@@ -2269,6 +2305,7 @@ async def _fetch_group_participants(fs: FrameSocket, ns) -> None:
         except (asyncio.CancelledError, Exception):
             pass
 
+    save_chats(chats)
     save_contacts(contacts)
     save_lidmap(lidmap)
     save_group_fetches(fetches)
@@ -2516,6 +2553,10 @@ async def _post_success(
         )
         await _fetch_group_participants(fs, ns)
     else:
+        # Skip the full TTL-aware refresh but still resolve names for any
+        # groups we've recently joined (chats.json has the JID but no
+        # subject). Cheap — typically 0 groups, occasionally a couple.
+        await _fetch_group_participants(fs, ns, only_unnamed=True)
         click.echo(click.style("authenticated — draining offline queue...", fg="green"))
 
     # Idle-timeout drain. We don't know in advance how much queued mail
