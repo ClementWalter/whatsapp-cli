@@ -771,10 +771,9 @@ def send(peer: str, text: str) -> None:
             )
 
     if peer_jid.endswith("@g.us"):
-        click.echo("group sends are not implemented yet (needs Sender Keys)", err=True)
-        raise SystemExit(1)
-
-    asyncio.run(_send_async(dev, peer_jid, text))
+        asyncio.run(_send_group_async(dev, peer_jid, text))
+    else:
+        asyncio.run(_send_async(dev, peer_jid, text))
 
 
 def _phash(devices: list[JID]) -> str:
@@ -1402,6 +1401,297 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
                 "no ack within 15s — message may or may not have been queued",
                 fg="yellow",
             ),
+            err=True,
+        )
+
+
+async def _fetch_group_members(
+    fs: FrameSocket, ns, group_jid: JID
+) -> tuple[list[JID], str]:
+    """Get the current participant list for ``group_jid``.
+
+    Returns ``(participants, addressing_mode)`` where ``participants`` is
+    a list of per-member JIDs (typically @lid for modern groups) without
+    device numbers, and ``addressing_mode`` is the group's own
+    ``"lid"`` / ``"pn"`` attribute. Mirrors the same IQ we use in
+    ``_fetch_group_participants`` but returns the raw structure so the
+    send path can iterate.
+    """
+    import secrets
+
+    iq_id = f"gi-{secrets.token_hex(4)}"
+    iq = Node(
+        tag="iq",
+        attrs={"to": group_jid, "type": "get", "id": iq_id, "xmlns": "w:g2"},
+        content=[Node(tag="query", attrs={"request": "interactive"})],
+    )
+    await fs.send(ns.encrypt_frame(encode_node(iq)))
+    deadline = asyncio.get_event_loop().time() + 8.0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            ct = await fs.recv(
+                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
+            )
+        except (asyncio.TimeoutError, ConnectionError):
+            break
+        try:
+            node = decode_node(ns.decrypt_frame(ct))
+        except Exception:
+            continue
+        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+            continue
+        if node.attrs.get("type") == "error":
+            err = node.get_child_by_tag("error")
+            raise RuntimeError(f"group info IQ rejected: {err.attrs if err else node.attrs}")
+        grp = node.get_child_by_tag("group")
+        if grp is None:
+            raise RuntimeError("group info reply has no <group>")
+        addressing_mode = grp.attrs.get("addressing_mode", "pn") or "pn"
+        participants: list[JID] = []
+        for child in grp.get_children():
+            if child.tag != "participant":
+                continue
+            pjid = child.attrs.get("jid")
+            if isinstance(pjid, JID):
+                participants.append(pjid)
+        return participants, addressing_mode
+    raise TimeoutError("group info IQ timed out")
+
+
+async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
+    """Send a text message to a group via Sender Keys + skmsg.
+
+    Per-message flow (mirrors whatsmeow's ``sendGroup``):
+
+    1. Fetch the group's participant list + addressing mode.
+    2. ``usync`` the participants to expand to per-device AD JIDs.
+    3. Generate (or refresh) our sender key for this group.
+    4. Wrap the SKDM in ``Message{senderKeyDistributionMessage: {...}}``,
+       Signal-encrypt that to every participant device — pre-key bundle
+       fetch fills missing sessions.
+    5. ``group_encrypt`` the actual plaintext to a single ``skmsg`` blob.
+    6. Build ``<message to=<group> type=text id=...><participants>...
+       </participants><enc type=skmsg/>[<device-identity/>]</message>``,
+       send, await ack.
+    """
+    import secrets
+    import time as _time
+
+    from wa.cache import CachedMessage, append_messages, upsert_chat
+    from wa.peerreq import _length_delim, _string_field, pad_for_signal
+
+    log = logging.getLogger("send")
+
+    own_pn = JID.parse(device.jid)
+    own_lid = JID.parse(device.lid) if device.lid else None
+    own_self_device = own_pn.device
+
+    group_jid_obj = JID(user=group_jid.split("@")[0], server="g.us")
+
+    async with FrameSocket() as fs:
+        await fs.connect()
+        try:
+            ns = await do_handshake(fs, device, build_login_payload(device))
+        except Exception as e:
+            click.echo(click.style(f"handshake failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+        while True:
+            try:
+                ct = await fs.recv(timeout=15.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                click.echo(click.style("no <success/>", fg="red"), err=True)
+                raise SystemExit(1)
+            node = decode_node(ns.decrypt_frame(ct))
+            if node.tag == "success":
+                break
+            if node.tag == "failure":
+                click.echo(
+                    click.style(f"login rejected: {_pretty(node)}", fg="red"),
+                    err=True,
+                )
+                raise SystemExit(1)
+
+        active = Node(
+            tag="iq",
+            attrs={
+                "to": JID(server="s.whatsapp.net"),
+                "type": "set",
+                "id": "send-active",
+                "xmlns": "passive",
+            },
+            content=[Node(tag="active")],
+        )
+        await fs.send(ns.encrypt_frame(encode_node(active)))
+        active_dl = asyncio.get_event_loop().time() + 5.0
+        while asyncio.get_event_loop().time() < active_dl:
+            try:
+                ct = await fs.recv(timeout=0.5)
+            except (asyncio.TimeoutError, ConnectionError):
+                break
+            n = decode_node(ns.decrypt_frame(ct))
+            if n.tag == "iq" and n.attrs.get("id") == "send-active":
+                break
+
+        # 1. Group participants + addressing mode.
+        try:
+            participants, addressing_mode = await _fetch_group_members(
+                fs, ns, group_jid_obj
+            )
+        except Exception as e:
+            click.echo(click.style(f"group info failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+        if not participants:
+            click.echo(
+                click.style("group has no participants — are you still in it?", fg="red"),
+                err=True,
+            )
+            raise SystemExit(1)
+        log.info(
+            "group %s: %d participants, addressing_mode=%s",
+            group_jid, len(participants), addressing_mode,
+        )
+
+        # 2. Expand to AD JIDs via usync. Whatsmeow uses the participant
+        # list as-is (LIDs for LID-addressed groups).
+        try:
+            all_devices = await _usync_devices(fs, ns, participants)
+        except Exception as e:
+            click.echo(
+                click.style(f"device list query failed: {e}", fg="red"), err=True
+            )
+            raise SystemExit(1)
+        # Drop our own current device from the recipient set.
+        sender_user = own_lid.user if (addressing_mode == "lid" and own_lid) else own_pn.user
+        targets = [
+            d for d in all_devices
+            if not (d.user == sender_user and d.device == own_self_device)
+        ]
+        log.info("targets: %d device(s) across %d participants", len(targets), len(participants))
+
+        # 3. Generate the SKDM for this group + our LID-keyed sender addr.
+        signal = SignalSession(device)
+        skdm_bytes = signal.create_sender_key_distribution(
+            group_id=str(group_jid_obj), sender_user=sender_user, sender_device=own_self_device
+        )
+
+        # 4. Wrap in Message{senderKeyDistributionMessage{groupID, axolotl_bytes}}
+        skdm_inner = _string_field(1, str(group_jid_obj)) + _length_delim(2, skdm_bytes)
+        skdm_message_proto = _length_delim(2, skdm_inner)
+        skdm_padded = pad_for_signal(skdm_message_proto)
+
+        # Fetch bundles for sessionless devices in one batch.
+        no_session_devices = [
+            d for d in targets if not signal.has_session(d.user, d.device)
+        ]
+        if no_session_devices:
+            log.info("fetching prekey bundles for %d device(s)", len(no_session_devices))
+            try:
+                bundles = await _fetch_prekey_bundles(fs, ns, no_session_devices)
+            except Exception as e:
+                log.warning("prekey fetch failed: %s", e)
+                bundles = {}
+            for d in no_session_devices:
+                b = bundles.get(d.ad_string())
+                if not b:
+                    continue
+                try:
+                    signal.install_prekey_bundle(d.user, d.device, **b)
+                except Exception as e:
+                    log.warning("bundle install failed for %s: %s", d, e)
+
+        participant_children: list[Node] = []
+        any_pkmsg = False
+        skipped: list[str] = []
+        for dev in targets:
+            try:
+                ct, kind = signal.encrypt_msg(dev.user, dev.device, skdm_padded)
+            except Exception as e:
+                skipped.append(f"{dev.user}:{dev.device}")
+                log.debug("skipping %s: %s", dev, e)
+                continue
+            if kind == "pkmsg":
+                any_pkmsg = True
+            participant_children.append(
+                Node(
+                    tag="to",
+                    attrs={"jid": dev},
+                    content=[Node(tag="enc", attrs={"v": "2", "type": kind}, content=ct)],
+                )
+            )
+        if skipped:
+            log.warning("skipped %d device(s) with no encryptable session", len(skipped))
+        if not participant_children:
+            click.echo(
+                click.style("no encryptable participants — aborting", fg="red"),
+                err=True,
+            )
+            raise SystemExit(1)
+
+        # 5. Encrypt the actual user message via group cipher.
+        message_plaintext = _build_message_plaintext(text)
+        skmsg_padded = pad_for_signal(message_plaintext)
+        try:
+            skmsg_ct = signal.group_encrypt(
+                str(group_jid_obj), sender_user, own_self_device, skmsg_padded
+            )
+        except Exception as e:
+            click.echo(click.style(f"group encrypt failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+
+        # 6. Build stanza. Group sends DO set `phash` (unlike DMs), and
+        # set `addressing_mode` to match the group's mode.
+        phash = _phash(all_devices)
+        msg_id = "3EB0" + secrets.token_hex(9).upper()
+        stanza_attrs: dict = {
+            "to": group_jid_obj,
+            "type": "text",
+            "id": msg_id,
+            "phash": phash,
+            "addressing_mode": addressing_mode,
+        }
+        content_nodes: list[Node] = [
+            Node(tag="participants", content=participant_children),
+            Node(tag="enc", attrs={"v": "2", "type": "skmsg"}, content=skmsg_ct),
+        ]
+        if any_pkmsg and device.account:
+            content_nodes.append(Node(tag="device-identity", content=device.account))
+        stanza = Node(tag="message", attrs=stanza_attrs, content=content_nodes)
+        await fs.send(ns.encrypt_frame(encode_node(stanza)))
+        log.info(
+            "sent skmsg id=%s to=%s participants=%d any_pkmsg=%s",
+            msg_id, group_jid, len(participant_children), any_pkmsg,
+        )
+
+        ack_dl = asyncio.get_event_loop().time() + 15.0
+        while asyncio.get_event_loop().time() < ack_dl:
+            try:
+                ct = await fs.recv(
+                    timeout=max(0.1, ack_dl - asyncio.get_event_loop().time())
+                )
+            except (asyncio.TimeoutError, ConnectionError):
+                break
+            try:
+                node = decode_node(ns.decrypt_frame(ct))
+            except Exception:
+                continue
+            if node.tag == "ack" and node.attrs.get("id") == msg_id:
+                ts = int(_time.time())
+                append_messages([
+                    CachedMessage(
+                        ts=ts,
+                        chat=group_jid,
+                        sender=str(own_pn) if own_pn.user else "",
+                        sender_name="me",
+                        text=text,
+                        from_me=True,
+                        msg_id=msg_id,
+                    )
+                ])
+                upsert_chat(group_jid, last_ts=ts)
+                click.echo(click.style(f"sent: {msg_id}", fg="green"))
+                return
+        click.echo(
+            click.style("no ack within 15s — message may or may not have been queued", fg="yellow"),
             err=True,
         )
 

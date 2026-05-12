@@ -191,6 +191,33 @@ class SignalSession:
             rec = state.PreKeyRecord(k["key_id"], kp)
             self._store.save_pre_key(k["key_id"], rec)
 
+    def create_sender_key_distribution(
+        self, group_id: str, sender_user: str, sender_device: int
+    ) -> bytes:
+        """Build or refresh our sender key for ``group_id`` and return the SKDM.
+
+        Returned bytes are the serialized ``AxolotlSenderKeyDistributionMessage``
+        — to be wrapped in a ``Message{senderKeyDistributionMessage: ...}``
+        and Signal-encrypted to each recipient device so they can install
+        the key and decrypt subsequent ``skmsg`` payloads in this group.
+        """
+        sender_addr = self._address_from_jid(sender_user, sender_device)
+        name = sender_keys.SenderKeyName(group_id, sender_addr)
+        skdm = group_cipher.create_sender_key_distribution_message(name, self._store)
+        return bytes(skdm.serialize())
+
+    def group_encrypt(
+        self,
+        group_id: str,
+        sender_user: str,
+        sender_device: int,
+        plaintext: bytes,
+    ) -> bytes:
+        """Encrypt ``plaintext`` for the group, returns the ``skmsg`` ciphertext."""
+        sender_addr = self._address_from_jid(sender_user, sender_device)
+        name = sender_keys.SenderKeyName(group_id, sender_addr)
+        return bytes(group_cipher.group_encrypt(self._store, name, plaintext))
+
     def has_session(self, jid_user: str, device_num: int) -> bool:
         """True if we have an established Signal session with this address.
 
