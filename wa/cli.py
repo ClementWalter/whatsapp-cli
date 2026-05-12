@@ -464,6 +464,29 @@ def status() -> None:
         click.echo(f"paired as {dev.jid} ({dev.push_name or '?'}) on {dev.platform}")
     else:
         click.echo("keys generated but not paired — run `login` to scan a QR")
+        return
+
+    from wa.cache import load_sync_state
+
+    sync_state = load_sync_state()
+    last_ts = sync_state.get("last_sync_ts", 0)
+    if last_ts:
+        import time as _time
+        from datetime import datetime
+
+        age_s = int(_time.time() - last_ts)
+        if age_s < 60:
+            age = f"{age_s}s ago"
+        elif age_s < 3600:
+            age = f"{age_s // 60}m ago"
+        elif age_s < 86400:
+            age = f"{age_s // 3600}h ago"
+        else:
+            age = f"{age_s // 86400}d ago"
+        when = datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M")
+        click.echo(f"last sync: {when} ({age}, {sync_state.get('last_frames', 0)} frames)")
+    else:
+        click.echo("last sync: never — run `wa sync`")
 
 
 @cli.command()
@@ -484,9 +507,17 @@ def login(reset: bool) -> None:
 @click.option(
     "--seconds",
     type=float,
-    default=30.0,
+    default=120.0,
     show_default=True,
-    help="How long to stay connected and drain the offline-message queue.",
+    help="Hard cap on total drain time, for pathological queues.",
+)
+@click.option(
+    "--idle",
+    type=float,
+    default=3.0,
+    show_default=True,
+    help="Stop after this many seconds of silence — i.e. when the offline "
+    "queue is empty and we're caught up to 'latest sync'.",
 )
 @click.option(
     "--refresh-groups",
@@ -494,22 +525,27 @@ def login(reset: bool) -> None:
     help="Also re-query every cached group's participant list (slow: "
     "~150ms per group, capped by WA_GROUPINFO_CAP).",
 )
-def sync(seconds: float, refresh_groups: bool) -> None:
+def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     """Reconnect with existing keys and ingest queued messages.
 
-    Required because this CLI has no daemon: every minute you're not
-    connected, the server queues new messages and ``chats`` shows stale
-    activity timestamps. ``sync`` opens the WebSocket, the server replays
-    the offline queue, the listener decrypts each ``<message>`` via the
-    stored Signal sessions, and ``chats.json`` / ``messages.jsonl`` get
-    updated. No QR — the device must already be paired.
+    The CLI has no daemon: every minute you're not connected, the server
+    queues new messages and ``chats`` shows stale activity timestamps.
+    ``sync`` opens the WebSocket; the server replays everything queued
+    since the last connection; the listener decrypts each ``<message>``
+    via the stored Signal sessions and writes to ``chats.json`` /
+    ``messages.jsonl``. Exits as soon as the server goes quiet for
+    ``--idle`` seconds (default 3) — so a quick check is ~3s, a long
+    catch-up runs until the queue drains. No QR; device must already be
+    paired.
     """
     dev = Device.load()
     if dev is None or not dev.is_paired():
         click.echo("not paired — run `login` first", err=True)
         raise SystemExit(1)
     asyncio.run(
-        _login_handshake(dev, seconds=seconds, fetch_groups=refresh_groups)
+        _login_handshake(
+            dev, seconds=seconds, idle=idle, fetch_groups=refresh_groups
+        )
     )
 
 
@@ -1260,18 +1296,23 @@ async def _post_success(
     device: Device,
     *,
     seconds: float = 60.0,
+    idle: float = 3.0,
     fetch_groups: bool = True,
 ) -> None:
-    """Behave like a real client for ``seconds`` after <success/>.
+    """Behave like a real client after <success/>, drain the offline queue.
 
     Sends the active-IQ the phone is waiting on, ACKs server-initiated IQs,
     and attempts to Signal-decrypt any ``<enc>`` payloads so we can see the
     peer content (typically app-state keys and history sync).
 
+    Termination is whichever happens first:
+
+    - ``idle`` seconds pass without any frame from the server (queue is
+      drained — we're caught up to "latest sync"). This is the normal exit.
+    - ``seconds`` total elapse (safety cap for pathological queues).
+
     ``fetch_groups`` controls whether to query every cached group's
-    participant list. That's a ~38s sequential IQ roundtrip wall on a busy
-    account, only useful when contact names are missing — `wa sync`
-    disables it.
+    participant list before draining. Disabled by `wa sync`.
     """
     from wa.wabinary.jid import JID as _JID
 
@@ -1324,18 +1365,39 @@ async def _post_success(
     else:
         click.echo(click.style("authenticated — draining offline queue...", fg="green"))
 
-    deadline = asyncio.get_event_loop().time() + seconds
-    while asyncio.get_event_loop().time() < deadline:
-        remaining = deadline - asyncio.get_event_loop().time()
-        try:
-            ct = await fs.recv(timeout=max(0.1, remaining))
-        except (asyncio.TimeoutError, ConnectionError):
+    # Idle-timeout drain. We don't know in advance how much queued mail
+    # the server will replay, so commit to a hard wall (`seconds`) but
+    # exit early as soon as the server goes quiet for `idle` seconds —
+    # at that point the offline queue is empty and we're caught up.
+    started = asyncio.get_event_loop().time()
+    hard_deadline = started + seconds
+    last_frame_ts = started
+    frames_seen = 0
+    while True:
+        now = asyncio.get_event_loop().time()
+        if now >= hard_deadline:
+            log.info("hit hard cap of %.0fs (received %d frames)", seconds, frames_seen)
             break
+        if now - last_frame_ts >= idle:
+            log.info(
+                "queue idle for %.1fs after %d frames — caught up",
+                idle, frames_seen,
+            )
+            break
+        # Wake at whichever boundary comes first (idle or hard cap), so we
+        # never block past either.
+        wait = min(idle - (now - last_frame_ts), hard_deadline - now)
+        try:
+            ct = await fs.recv(timeout=max(0.1, wait))
+        except (asyncio.TimeoutError, ConnectionError):
+            continue
         try:
             node = decode_node(ns.decrypt_frame(ct))
         except Exception as e:
             log.warning("failed to decode frame: %s", e)
             continue
+        last_frame_ts = asyncio.get_event_loop().time()
+        frames_seen += 1
         log.debug("post-success frame:\n%s", _pretty(node))
         # Try to decrypt any <enc> inside <message>; log plaintext metadata.
         if node.tag == "message":
@@ -1367,7 +1429,18 @@ async def _post_success(
                 },
             )
             await fs.send(ns.encrypt_frame(encode_node(ack)))
-    click.echo(click.style("session closed — phone should be paired.", fg="green"))
+    # Record successful drain so `wa status` can show how stale we are.
+    try:
+        import time as _time
+
+        from wa.cache import save_sync_state
+
+        save_sync_state({"last_sync_ts": int(_time.time()), "last_frames": frames_seen})
+    except Exception as e:
+        log.debug("could not persist sync state: %s", e)
+    click.echo(
+        click.style(f"session closed — drained {frames_seen} frames.", fg="green")
+    )
 
 
 async def _extend_chat(chat_jid: str, count: int) -> int:
@@ -1548,13 +1621,17 @@ async def _ingest_now(chat_jid: str) -> int:
 
 
 async def _login_handshake(
-    device: Device, *, seconds: float = 60.0, fetch_groups: bool = True
+    device: Device,
+    *,
+    seconds: float = 60.0,
+    idle: float = 3.0,
+    fetch_groups: bool = True,
 ) -> None:
     """Handshake with the login payload (not registration) and wait for <success/>.
 
     The phone's Linked Devices dialog only closes once this step completes
     against the server; it's also the normal startup path for an already-
-    paired device. ``seconds`` and ``fetch_groups`` forward to
+    paired device. ``seconds``, ``idle``, and ``fetch_groups`` forward to
     :func:`_post_success` for the post-auth drain phase.
     """
     async with FrameSocket() as fs:
@@ -1578,7 +1655,12 @@ async def _login_handshake(
             node = decode_node(ns.decrypt_frame(ct))
             if node.tag == "success":
                 await _post_success(
-                    fs, ns, device, seconds=seconds, fetch_groups=fetch_groups
+                    fs,
+                    ns,
+                    device,
+                    seconds=seconds,
+                    idle=idle,
+                    fetch_groups=fetch_groups,
                 )
                 return
             if node.tag == "failure":
