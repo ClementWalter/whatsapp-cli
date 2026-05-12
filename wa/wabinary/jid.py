@@ -79,3 +79,15 @@ class JID:
         if self.device:
             base = f"{base}:{self.device}"
         return f"{base}@{self.server}"
+
+    def ad_string(self) -> str:
+        """Always-AD-form: ``user.agent:device@server``, including zeros.
+
+        Mirrors whatsmeow's ``JID.ADString()``. Used to compute the
+        ``phash`` participant-list hash on outgoing messages — both ends
+        must agree on the canonical string form bit-for-bit. Uses
+        ``actual_agent()`` (1 for LID, 0 for PN) so a JID dataclass with
+        a defaulted ``agent=0`` field hashes the same way the wire form
+        is interpreted by the server.
+        """
+        return f"{self.user}.{self.actual_agent()}:{self.device}@{self.server}"
