@@ -77,7 +77,8 @@ class SignalSession:
         self._path = signal_path
         self._store = self._build_store()
         self._sessions: dict[str, bytes] = {}
-        self._load_sessions()
+        self._sender_keys: dict[str, bytes] = {}
+        self._load_all()
 
     # --- store construction ------------------------------------------------
 
@@ -156,6 +157,7 @@ class SignalSession:
             group_id, address.ProtocolAddress(sender_user, sender_device)
         )
         group_cipher.process_sender_key_distribution_message(skn, skdm, self._store)
+        self._persist_sender_key(group_id, sender_user, sender_device)
 
     def decrypt_skmsg(
         self,
@@ -174,6 +176,10 @@ class SignalSession:
             group_id, address.ProtocolAddress(sender_user, sender_device)
         )
         plaintext = group_cipher.group_decrypt(skm.serialize(), self._store, skn)
+        # Decrypt advances the receiver chain; persist so we don't
+        # re-derive the same message keys on the next process and reject
+        # already-consumed messages.
+        self._persist_sender_key(group_id, sender_user, sender_device)
         return _unpad(bytes(plaintext))
 
     def save_one_time_prekeys(self, prekeys: list[dict]) -> None:
@@ -204,6 +210,7 @@ class SignalSession:
         sender_addr = self._address_from_jid(sender_user, sender_device)
         name = sender_keys.SenderKeyName(group_id, sender_addr)
         skdm = group_cipher.create_sender_key_distribution_message(name, self._store)
+        self._persist_sender_key(group_id, sender_user, sender_device)
         return bytes(skdm.serialize())
 
     def group_encrypt(
@@ -216,7 +223,12 @@ class SignalSession:
         """Encrypt ``plaintext`` for the group, returns the ``skmsg`` ciphertext."""
         sender_addr = self._address_from_jid(sender_user, sender_device)
         name = sender_keys.SenderKeyName(group_id, sender_addr)
-        return bytes(group_cipher.group_encrypt(self._store, name, plaintext))
+        ct = bytes(group_cipher.group_encrypt(self._store, name, plaintext))
+        # The chain advances on every encrypt — persist so the next
+        # process picks up where we left off rather than rotating the
+        # key and forcing recipients to re-process an SKDM.
+        self._persist_sender_key(group_id, sender_user, sender_device)
+        return ct
 
     def has_session(self, jid_user: str, device_num: int) -> bool:
         """True if we have an established Signal session with this address.
@@ -310,12 +322,38 @@ class SignalSession:
         if s is None:
             return
         self._sessions[self._session_key(addr)] = s.serialize()
-        self._save_sessions()
+        self._save_all()
 
-    def _load_sessions(self) -> None:
+    def _sender_key_storage_key(
+        self, group_id: str, sender_user: str, sender_device: int
+    ) -> str:
+        # JSON-safe composite of (group, sender). Group IDs contain `@`,
+        # sender_user is digits, so `/` is unambiguous as a separator.
+        return f"{group_id}/{sender_user}:{sender_device}"
+
+    def _persist_sender_key(
+        self, group_id: str, sender_user: str, sender_device: int
+    ) -> None:
+        name = sender_keys.SenderKeyName(
+            group_id, address.ProtocolAddress(sender_user, sender_device)
+        )
+        rec = self._store.load_sender_key(name)
+        if rec is None:
+            return
+        self._sender_keys[
+            self._sender_key_storage_key(group_id, sender_user, sender_device)
+        ] = bytes(rec.serialize())
+        self._save_all()
+
+    def _load_all(self) -> None:
+        """Restore sessions and sender keys from ``signal.json``."""
         if not self._path.exists():
             return
-        data = json.loads(self._path.read_text())
+        try:
+            data = json.loads(self._path.read_text())
+        except Exception as e:
+            log.warning("signal.json unreadable, starting fresh: %s", e)
+            return
         for key, b64 in data.get("sessions", {}).items():
             user, _, dev = key.rpartition(":")
             try:
@@ -325,11 +363,29 @@ class SignalSession:
                 self._sessions[key] = _unb64(b64)
             except Exception as e:
                 log.warning("failed to restore session %s: %s", key, e)
+        for key, b64 in data.get("sender_keys", {}).items():
+            # `group_id/sender_user:device`
+            try:
+                group_id, _, addr_part = key.partition("/")
+                user, _, dev = addr_part.rpartition(":")
+                raw = _unb64(b64)
+                rec = sender_keys.SenderKeyRecord.deserialize(raw)
+                skn = sender_keys.SenderKeyName(
+                    group_id, address.ProtocolAddress(user, int(dev))
+                )
+                self._store.store_sender_key(skn, rec)
+                self._sender_keys[key] = raw
+            except Exception as e:
+                log.warning("failed to restore sender key %s: %s", key, e)
 
-    def _save_sessions(self) -> None:
+    def _save_all(self) -> None:
+        """Atomic write of both sessions and sender keys to ``signal.json``."""
         self._path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self._path.with_suffix(".tmp")
-        payload = {"sessions": {k: _b64(v) for k, v in self._sessions.items()}}
+        payload = {
+            "sessions": {k: _b64(v) for k, v in self._sessions.items()},
+            "sender_keys": {k: _b64(v) for k, v in self._sender_keys.items()},
+        }
         tmp.write_text(json.dumps(payload, indent=2))
         os.chmod(tmp, 0o600)
         tmp.replace(self._path)

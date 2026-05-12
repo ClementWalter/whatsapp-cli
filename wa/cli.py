@@ -506,7 +506,10 @@ def read(
                 err=True,
             )
             try:
-                added = asyncio.run(_extend_chat(chat_jid, need))
+                from wa.cache import connection_lock
+
+                with connection_lock():
+                    added = asyncio.run(_extend_chat(chat_jid, need))
                 if added > 0:
                     click.echo(
                         click.style(f"fetched +{added} new messages", fg="green"),
@@ -673,7 +676,10 @@ def login(reset: bool) -> None:
         click.echo("generating fresh device keys...")
         dev = Device.new()
         dev.save()
-    asyncio.run(_login_async(dev))
+    from wa.cache import connection_lock
+
+    with connection_lock():
+        asyncio.run(_login_async(dev))
 
 
 @cli.command()
@@ -715,11 +721,14 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     if dev is None or not dev.is_paired():
         click.echo("not paired — run `login` first", err=True)
         raise SystemExit(1)
-    asyncio.run(
-        _login_handshake(
-            dev, seconds=seconds, idle=idle, fetch_groups=refresh_groups
+    from wa.cache import connection_lock
+
+    with connection_lock():
+        asyncio.run(
+            _login_handshake(
+                dev, seconds=seconds, idle=idle, fetch_groups=refresh_groups
+            )
         )
-    )
 
 
 @cli.command()
@@ -770,10 +779,13 @@ def send(peer: str, text: str) -> None:
                 err=True,
             )
 
-    if peer_jid.endswith("@g.us"):
-        asyncio.run(_send_group_async(dev, peer_jid, text))
-    else:
-        asyncio.run(_send_async(dev, peer_jid, text))
+    from wa.cache import connection_lock
+
+    with connection_lock():
+        if peer_jid.endswith("@g.us"):
+            asyncio.run(_send_group_async(dev, peer_jid, text))
+        else:
+            asyncio.run(_send_async(dev, peer_jid, text))
 
 
 def _phash(devices: list[JID]) -> str:
@@ -2509,6 +2521,10 @@ async def _post_success(
     log = logging.getLogger("login")
     server_jid = _JID(server="s.whatsapp.net")
     signal = SignalSession(device)
+    # Cached own JIDs for self-vs-peer classification on incoming
+    # `<message>` frames when we send `<receipt>` back.
+    own_pn = JID.parse(device.jid) if device.jid else JID()
+    own_lid = JID.parse(device.lid) if device.lid else None
 
     # First-pair: upload one-time prekeys so the phone's UI can resolve.
     # The phone's "Linked Devices" dialog stays in "connecting…" state
@@ -2612,6 +2628,31 @@ async def _post_success(
                 ack_attrs["type"] = node.attrs["type"]
             ack = Node(tag="ack", attrs=ack_attrs)
             await fs.send(ns.encrypt_frame(encode_node(ack)))
+        # The sender's "delivered ✓✓" indicator requires a <receipt> back
+        # to them — separate from the transport <ack> above. Without
+        # this, WhatsApp keeps re-queueing the same messages on every
+        # connection because it never learns we received them. Type
+        # `sender` for our own device-sent messages (echoes from other
+        # linked devices), no type for peer messages = "delivered".
+        if node.tag == "message":
+            sender = node.attrs.get("participant") or node.attrs.get("from")
+            is_own_echo = (
+                isinstance(sender, JID)
+                and sender.user
+                in {own_pn.user, (own_lid.user if own_lid else None)}
+            )
+            receipt_attrs = {
+                "id": node.attrs.get("id", ""),
+                "to": node.attrs.get("from", server_jid),
+            }
+            for k in ("participant", "recipient"):
+                if k in node.attrs:
+                    receipt_attrs[k] = node.attrs[k]
+            if is_own_echo:
+                receipt_attrs["type"] = "sender"
+            await fs.send(
+                ns.encrypt_frame(encode_node(Node(tag="receipt", attrs=receipt_attrs)))
+            )
         # ACK every server-initiated IQ so we don't look unresponsive.
         if node.tag == "iq" and node.attrs.get("type") == "set":
             ack = Node(
