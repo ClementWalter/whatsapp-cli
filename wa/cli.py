@@ -250,7 +250,17 @@ def chats(limit: int, json_out: bool) -> None:
         # Groups always have an app-state name. DMs don't — WhatsApp doesn't
         # sync address-book labels to linked devices, so fall back to whatever
         # `import-contacts` or pushname syncs wrote into contacts.json.
-        return info.get("name") or contacts.get(jid) or "(unnamed)"
+        if name := (info.get("name") or contacts.get(jid)):
+            return name
+        # Legacy rows: a now-fixed bug used to store @lid peers as
+        # `<lid>@s.whatsapp.net`. Phone numbers are <=13 digits; a longer
+        # local part is almost certainly a LID. Probe contacts under the
+        # correct @lid key so historical chats still resolve.
+        local = jid.split("@")[0]
+        if jid.endswith("@s.whatsapp.net") and local.isdigit() and len(local) > 13:
+            if name := contacts.get(f"{local}@lid"):
+                return name
+        return "(unnamed)"
 
     if json_out:
         click.echo(
@@ -823,10 +833,22 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
         pretty = _extract_text(pt)
         if pretty:
             sender_name = node.attrs.get("notify", "")
+            # Preserve the original server on the JID. Hardcoding
+            # `@s.whatsapp.net` for non-group chats was wrong: many DMs in
+            # the post-2024 WhatsApp world come from `@lid` identifiers
+            # (15-digit privacy-preserving IDs), and forcing them into the
+            # PN namespace makes them un-resolvable against `contacts.json`
+            # and `lidmap.json`, so they show up as `(unnamed)` forever.
             if isinstance(from_jid, JID) and from_jid.server == "g.us":
                 chat_jid = f"{from_jid.user}@g.us"
+            elif isinstance(from_jid, JID):
+                chat_jid = f"{from_jid.user}@{from_jid.server}"
             else:
-                chat_jid = f"{jid_user}@s.whatsapp.net"
+                chat_jid = f"{jid_user}@s.whatsapp.net"  # last-resort fallback
+            if isinstance(sender, JID):
+                sender_jid = f"{sender.user}@{sender.server}"
+            else:
+                sender_jid = f"{jid_user}@s.whatsapp.net"
             ts_attr = node.attrs.get("t", 0)
             try:
                 ts = int(ts_attr)
@@ -843,7 +865,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                     CachedMessage(
                         ts=ts,
                         chat=chat_jid,
-                        sender=f"{jid_user}@s.whatsapp.net",
+                        sender=sender_jid,
                         sender_name=sender_name,
                         text=pretty,
                         from_me=False,
