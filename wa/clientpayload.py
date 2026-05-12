@@ -70,7 +70,7 @@ ECC_DJB_TYPE = 0x05
 
 def _device_props_bytes() -> bytes:
     props = waCompanionReg_pb2.DeviceProps()
-    props.os = "whatsapp-user-cli"
+    props.os = "whatsapp-cli"
     props.version.primary = 0
     props.version.secondary = 1
     props.version.tertiary = 0
