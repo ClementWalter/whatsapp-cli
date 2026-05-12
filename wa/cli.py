@@ -240,12 +240,26 @@ def import_contacts_cmd() -> None:
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
 def chats(limit: int, json_out: bool) -> None:
     """List known chats sorted by most recent activity."""
-    from wa.cache import load_chats
+    from wa.cache import load_chats, load_contacts
 
+    contacts = load_contacts()
     items = sorted(load_chats().items(), key=lambda kv: kv[1].get("last_ts", 0), reverse=True)
     items = items[:limit]
+
+    def _display_name(jid: str, info: dict) -> str:
+        # Groups always have an app-state name. DMs don't — WhatsApp doesn't
+        # sync address-book labels to linked devices, so fall back to whatever
+        # `import-contacts` or pushname syncs wrote into contacts.json.
+        return info.get("name") or contacts.get(jid) or "(unnamed)"
+
     if json_out:
-        click.echo(json.dumps([{"jid": j, **info} for j, info in items], ensure_ascii=False, indent=2))
+        click.echo(
+            json.dumps(
+                [{"jid": j, **info, "display_name": _display_name(j, info)} for j, info in items],
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     from datetime import datetime
 
@@ -253,7 +267,7 @@ def chats(limit: int, json_out: bool) -> None:
         ts = info.get("last_ts", 0)
         ts_s = datetime.fromtimestamp(ts).strftime("%Y-%m-%d") if ts else "—"
         kind = "group" if jid.endswith("@g.us") else "dm   "
-        name = info.get("name") or "(unnamed)"
+        name = _display_name(jid, info)
         click.echo(f"{ts_s}  {kind}  {name:<30s}  {jid}")
 
 
@@ -454,6 +468,39 @@ def login(reset: bool) -> None:
         dev = Device.new()
         dev.save()
     asyncio.run(_login_async(dev))
+
+
+@cli.command()
+@click.option(
+    "--seconds",
+    type=float,
+    default=30.0,
+    show_default=True,
+    help="How long to stay connected and drain the offline-message queue.",
+)
+@click.option(
+    "--refresh-groups",
+    is_flag=True,
+    help="Also re-query every cached group's participant list (slow: "
+    "~150ms per group, capped by WA_GROUPINFO_CAP).",
+)
+def sync(seconds: float, refresh_groups: bool) -> None:
+    """Reconnect with existing keys and ingest queued messages.
+
+    Required because this CLI has no daemon: every minute you're not
+    connected, the server queues new messages and ``chats`` shows stale
+    activity timestamps. ``sync`` opens the WebSocket, the server replays
+    the offline queue, the listener decrypts each ``<message>`` via the
+    stored Signal sessions, and ``chats.json`` / ``messages.jsonl`` get
+    updated. No QR — the device must already be paired.
+    """
+    dev = Device.load()
+    if dev is None or not dev.is_paired():
+        click.echo("not paired — run `login` first", err=True)
+        raise SystemExit(1)
+    asyncio.run(
+        _login_handshake(dev, seconds=seconds, fetch_groups=refresh_groups)
+    )
 
 
 async def _login_async(device: Device) -> None:
@@ -1119,12 +1166,24 @@ async def _upload_prekeys(fs: FrameSocket, ns, device: Device) -> None:
         log.debug("dropping out-of-order frame during prekey upload:\n%s", _pretty(node))
 
 
-async def _post_success(fs: FrameSocket, ns, device: Device) -> None:
-    """Behave like a real client for ~30s after <success/>.
+async def _post_success(
+    fs: FrameSocket,
+    ns,
+    device: Device,
+    *,
+    seconds: float = 60.0,
+    fetch_groups: bool = True,
+) -> None:
+    """Behave like a real client for ``seconds`` after <success/>.
 
     Sends the active-IQ the phone is waiting on, ACKs server-initiated IQs,
     and attempts to Signal-decrypt any ``<enc>`` payloads so we can see the
     peer content (typically app-state keys and history sync).
+
+    ``fetch_groups`` controls whether to query every cached group's
+    participant list. That's a ~38s sequential IQ roundtrip wall on a busy
+    account, only useful when contact names are missing — `wa sync`
+    disables it.
     """
     from wa.wabinary.jid import JID as _JID
 
@@ -1166,15 +1225,18 @@ async def _post_success(fs: FrameSocket, ns, device: Device) -> None:
             log.debug("active state confirmed")
             break
         log.debug("pre-active drain: %s id=%s", n.tag, n.attrs.get("id"))
-    click.echo(
-        click.style(
-            "authenticated — fetching group participants for name resolution...",
-            fg="green",
+    if fetch_groups:
+        click.echo(
+            click.style(
+                "authenticated — fetching group participants for name resolution...",
+                fg="green",
+            )
         )
-    )
-    await _fetch_group_participants(fs, ns)
+        await _fetch_group_participants(fs, ns)
+    else:
+        click.echo(click.style("authenticated — draining offline queue...", fg="green"))
 
-    deadline = asyncio.get_event_loop().time() + 60.0
+    deadline = asyncio.get_event_loop().time() + seconds
     while asyncio.get_event_loop().time() < deadline:
         remaining = deadline - asyncio.get_event_loop().time()
         try:
@@ -1397,12 +1459,15 @@ async def _ingest_now(chat_jid: str) -> int:
     return after - before
 
 
-async def _login_handshake(device: Device) -> None:
+async def _login_handshake(
+    device: Device, *, seconds: float = 60.0, fetch_groups: bool = True
+) -> None:
     """Handshake with the login payload (not registration) and wait for <success/>.
 
     The phone's Linked Devices dialog only closes once this step completes
     against the server; it's also the normal startup path for an already-
-    paired device.
+    paired device. ``seconds`` and ``fetch_groups`` forward to
+    :func:`_post_success` for the post-auth drain phase.
     """
     async with FrameSocket() as fs:
         await fs.connect()
@@ -1424,7 +1489,9 @@ async def _login_handshake(device: Device) -> None:
                 return
             node = decode_node(ns.decrypt_frame(ct))
             if node.tag == "success":
-                await _post_success(fs, ns, device)
+                await _post_success(
+                    fs, ns, device, seconds=seconds, fetch_groups=fetch_groups
+                )
                 return
             if node.tag == "failure":
                 click.echo(
