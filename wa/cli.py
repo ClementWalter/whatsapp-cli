@@ -795,6 +795,154 @@ def _phash(devices: list[JID]) -> str:
     return "2:" + base64.b64encode(digest).decode().rstrip("=")
 
 
+async def _fetch_prekey_bundles(
+    fs: FrameSocket, ns, devices: list[JID]
+) -> dict[str, dict]:
+    """Fetch X3DH prekey bundles for a set of device JIDs.
+
+    Returns ``{ad_string: {registration_id, identity_key, signed_pre_key_*,
+    pre_key_*}}``. Each entry is what
+    :func:`SignalSession.install_prekey_bundle` consumes. Devices missing
+    from the response (server error or unknown) are simply absent from
+    the dict — the caller skips them.
+
+    Schema mirrors whatsmeow's ``fetchPreKeys``:
+
+    .. code-block:: xml
+
+        <iq xmlns="encrypt" type="get" to="s.whatsapp.net">
+          <key>
+            <user jid="<device-AD-jid>" reason="identity"/>
+            ...
+          </key>
+        </iq>
+
+    The reply has ``<list><user jid=...><registration/><identity/>
+    <skey><id/><value/><signature/></skey>[<key><id/><value/></key>]</user></list>``.
+    """
+    import secrets
+
+    iq_id = f"prekey-{secrets.token_hex(4)}"
+    iq = Node(
+        tag="iq",
+        attrs={
+            "to": JID(server="s.whatsapp.net"),
+            "type": "get",
+            "id": iq_id,
+            "xmlns": "encrypt",
+        },
+        content=[
+            Node(
+                tag="key",
+                content=[
+                    Node(tag="user", attrs={"jid": d, "reason": "identity"})
+                    for d in devices
+                ],
+            )
+        ],
+    )
+    await fs.send(ns.encrypt_frame(encode_node(iq)))
+
+    deadline = asyncio.get_event_loop().time() + 10.0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            ct = await fs.recv(
+                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
+            )
+        except (asyncio.TimeoutError, ConnectionError):
+            break
+        try:
+            node = decode_node(ns.decrypt_frame(ct))
+        except Exception:
+            continue
+        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+            continue
+        if node.attrs.get("type") == "error":
+            err = node.get_child_by_tag("error")
+            raise RuntimeError(
+                f"prekey IQ rejected: {err.attrs if err else node.attrs}"
+            )
+        lst = node.get_child_by_tag("list")
+        if lst is None:
+            return {}
+        out: dict[str, dict] = {}
+        for user_node in lst.get_children():
+            if user_node.tag != "user":
+                continue
+            user_jid = user_node.attrs.get("jid")
+            if not isinstance(user_jid, JID):
+                continue
+            try:
+                bundle = _parse_prekey_user_node(user_node)
+            except Exception as e:
+                logging.getLogger("send").warning(
+                    "couldn't parse bundle for %s: %s", user_jid, e
+                )
+                continue
+            out[user_jid.ad_string()] = bundle
+        return out
+    raise TimeoutError("prekey IQ reply timeout")
+
+
+def _parse_prekey_user_node(user_node: Node) -> dict:
+    """Extract a single bundle from one ``<user>`` child of the IQ reply."""
+    import struct
+
+    def _bytes(tag: str) -> bytes | None:
+        child = user_node.get_child_by_tag(tag)
+        if child is None:
+            return None
+        c = child.content
+        if isinstance(c, (bytes, bytearray)):
+            return bytes(c)
+        return None
+
+    def _key_node_to_record(child: Node | None) -> dict | None:
+        if child is None:
+            return None
+        id_node = child.get_child_by_tag("id")
+        value_node = child.get_child_by_tag("value")
+        if id_node is None or value_node is None:
+            return None
+        id_bytes = id_node.content if isinstance(id_node.content, (bytes, bytearray)) else b""
+        pub = value_node.content if isinstance(value_node.content, (bytes, bytearray)) else b""
+        if not id_bytes or not pub:
+            return None
+        # WhatsApp encodes key IDs as 3-byte BE; pad to 4 for struct.
+        key_id = struct.unpack(">I", b"\x00" + bytes(id_bytes))[0]
+        sig_node = child.get_child_by_tag("signature")
+        sig = None
+        if sig_node is not None and isinstance(sig_node.content, (bytes, bytearray)):
+            sig = bytes(sig_node.content)
+        return {"key_id": key_id, "pub": bytes(pub), "sig": sig}
+
+    reg_bytes = _bytes("registration") or b"\x00\x00\x00\x00"
+    if len(reg_bytes) != 4:
+        raise ValueError(f"bad registration length {len(reg_bytes)}")
+    registration_id = struct.unpack(">I", reg_bytes)[0]
+
+    identity = _bytes("identity")
+    if identity is None or len(identity) != 32:
+        raise ValueError("missing/invalid identity")
+
+    # Older responses inline the keys; newer ones wrap them in `<keys>`.
+    keys_container = user_node.get_child_by_tag("keys") or user_node
+    skey = _key_node_to_record(keys_container.get_child_by_tag("skey"))
+    if skey is None or skey["sig"] is None:
+        raise ValueError("missing or unsigned skey")
+    opk = _key_node_to_record(keys_container.get_child_by_tag("key"))
+
+    return {
+        "registration_id": registration_id,
+        "identity_key_pub": identity,
+        "signed_pre_key_id": skey["key_id"],
+        "signed_pre_key_pub": skey["pub"],
+        "signed_pre_key_signature": skey["sig"],
+        "pre_key_id": opk["key_id"] if opk else None,
+        "pre_key_pub": opk["pub"] if opk else None,
+    }
+
+
 async def _usync_devices(
     fs: FrameSocket, ns, queried: list[JID]
 ) -> list[JID]:
@@ -1070,6 +1218,64 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
         log.info("device list (PN form): %s", [str(d) for d in all_devices])
 
         signal = SignalSession(device)
+        # Probe each device for an existing session; for any device that
+        # has none, fetch a prekey bundle so the first encrypt becomes a
+        # pkmsg via X3DH instead of failing with "session not found".
+        no_session_devices: list[JID] = []
+        for dev in all_devices:
+            is_own = (
+                (is_self_send and own_lid is not None and dev.user == own_lid.user)
+                or (not is_self_send and dev.user == own_pn.user)
+            )
+            if is_own and dev.device == own_self_device:
+                continue
+            if is_self_send:
+                enc_user = dev.user
+            elif is_own and own_lid is not None:
+                enc_user = own_lid.user
+            elif (not is_own) and peer_lid_user is not None:
+                enc_user = peer_lid_user
+            else:
+                enc_user = dev.user
+            if not signal.has_session(enc_user, dev.device):
+                no_session_devices.append(dev)
+        if no_session_devices:
+            log.info(
+                "fetching prekey bundles for %d device(s) with no session",
+                len(no_session_devices),
+            )
+            try:
+                bundles = await _fetch_prekey_bundles(fs, ns, no_session_devices)
+            except Exception as e:
+                log.warning("prekey fetch failed: %s — some devices will be skipped", e)
+                bundles = {}
+            for dev in no_session_devices:
+                bundle = bundles.get(dev.ad_string())
+                if bundle is None:
+                    log.debug("no bundle returned for %s", dev)
+                    continue
+                # Use the same encryption-identity rules as below.
+                is_own = (
+                    (is_self_send and own_lid is not None and dev.user == own_lid.user)
+                    or (not is_self_send and dev.user == own_pn.user)
+                )
+                if is_self_send:
+                    enc_user = dev.user
+                elif is_own and own_lid is not None:
+                    enc_user = own_lid.user
+                elif (not is_own) and peer_lid_user is not None:
+                    enc_user = peer_lid_user
+                else:
+                    enc_user = dev.user
+                try:
+                    signal.install_prekey_bundle(enc_user, dev.device, **bundle)
+                    log.debug("installed bundle for %s:%d", enc_user, dev.device)
+                except Exception as e:
+                    log.warning(
+                        "couldn't install bundle for %s:%d: %s",
+                        enc_user, dev.device, e,
+                    )
+
         participant_children: list[Node] = []
         missing_sessions: list[str] = []
         any_pkmsg = False

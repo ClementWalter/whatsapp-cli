@@ -30,6 +30,7 @@ from signal_protocol import (
     identity_key,
     protocol,
     sender_keys,
+    session,
     session_cipher,
     state,
     storage,
@@ -189,6 +190,61 @@ class SignalSession:
             kp = curve.KeyPair(kp_pub, kp_priv)
             rec = state.PreKeyRecord(k["key_id"], kp)
             self._store.save_pre_key(k["key_id"], rec)
+
+    def has_session(self, jid_user: str, device_num: int) -> bool:
+        """True if we have an established Signal session with this address.
+
+        Cheaper than trying to encrypt and catching the exception; used
+        by the send path to decide whether to fetch a prekey bundle.
+        """
+        addr = self._address_from_jid(jid_user, device_num)
+        try:
+            return self._store.load_session(addr) is not None
+        except Exception:
+            return False
+
+    def install_prekey_bundle(
+        self,
+        jid_user: str,
+        device_num: int,
+        *,
+        registration_id: int,
+        identity_key_pub: bytes,
+        signed_pre_key_id: int,
+        signed_pre_key_pub: bytes,
+        signed_pre_key_signature: bytes,
+        pre_key_id: int | None = None,
+        pre_key_pub: bytes | None = None,
+    ) -> None:
+        """Bootstrap a fresh outbound Signal session from a server-fetched bundle.
+
+        Required for sending to a peer/device we've never received from.
+        After this call, ``encrypt_msg(jid_user, device_num, ...)``
+        returns a ``pkmsg`` (PreKeySignalMessage) the recipient can
+        decrypt via X3DH. ``identity_key_pub`` / ``*_pub`` are the raw
+        32-byte Curve25519 publics returned by the prekey IQ, **without**
+        the leading ``0x05`` DJB-type byte — we add it here.
+        """
+        ik = identity_key.IdentityKey(b"\x05" + identity_key_pub)
+        spk = curve.PublicKey.deserialize(b"\x05" + signed_pre_key_pub)
+        opk = (
+            curve.PublicKey.deserialize(b"\x05" + pre_key_pub)
+            if pre_key_pub is not None
+            else None
+        )
+        bundle = state.PreKeyBundle(
+            registration_id,
+            device_num,
+            pre_key_id,
+            opk,
+            signed_pre_key_id,
+            spk,
+            signed_pre_key_signature,
+            ik,
+        )
+        addr = self._address_from_jid(jid_user, device_num)
+        session.process_prekey_bundle(addr, self._store, bundle)
+        self._persist_session(addr)
 
     def encrypt_msg(self, jid_user: str, device_num: int, plaintext: bytes) -> tuple[bytes, str]:
         """Encrypt a Signal message for an existing peer session.
