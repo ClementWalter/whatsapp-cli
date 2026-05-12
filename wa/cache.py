@@ -116,6 +116,38 @@ def save_sync_state(state: dict) -> None:
     _atomic_write_json(SYNC_STATE_PATH, state)
 
 
+def canonical_jid(
+    jid: str, *, lidmap_inverted: dict[str, str] | None = None
+) -> str:
+    """Map a peer JID to the canonical form used across the cache.
+
+    WhatsApp's post-2024 identity rollout routes most DMs through ``@lid``
+    privacy identifiers instead of ``@s.whatsapp.net`` phone-number JIDs,
+    so the same conversation can arrive under both. We prefer ``@lid`` as
+    canonical: it's what the live decrypt path receives today, and it
+    matches what WhatsApp Web stores. Two cases get folded:
+
+    - Polluted: 14+-digit ``@s.whatsapp.net`` locals are LIDs that the
+      old JID-server bug stored in the wrong namespace.
+    - Genuine PN/LID twins: a phone-number JID whose LID counterpart is
+      known via the inverted ``lidmap``.
+
+    Groups, already-@lid, and PN entries with no known LID twin are
+    returned unchanged. Passing ``lidmap_inverted`` avoids re-reading
+    ``lidmap.json`` on every call when batching (e.g. in ``migrate``).
+    """
+    if not jid.endswith("@s.whatsapp.net"):
+        return jid
+    local = jid.split("@")[0]
+    if local.isdigit() and len(local) > 13:
+        return f"{local}@lid"
+    if lidmap_inverted is None:
+        lidmap_inverted = {pn: lid for lid, pn in load_lidmap().items()}
+    if (lid := lidmap_inverted.get(jid)):
+        return f"{lid}@lid"
+    return jid
+
+
 def append_messages(messages: list[CachedMessage]) -> None:
     """Append a batch to ``messages.jsonl``. Existing duplicates are not
     deduplicated here — the caller is expected to skip msg_ids already seen.

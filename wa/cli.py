@@ -268,9 +268,8 @@ def migrate_cmd(dry_run: bool) -> None:
     import time as _time
 
     from wa.cache import (
-        CHATS_PATH,
-        CONTACTS_PATH,
         MESSAGES_PATH,
+        canonical_jid,
         load_chats,
         load_contacts,
         load_lidmap,
@@ -281,22 +280,10 @@ def migrate_cmd(dry_run: bool) -> None:
     chats = load_chats()
     contacts = load_contacts()
     lidmap = load_lidmap()
-    # lidmap maps lid_user → "<pn>@s.whatsapp.net". Invert so a PN JID
-    # tells us its LID local-part counterpart.
+    # Invert lidmap once so the canonical-JID helper doesn't re-read it
+    # for every entry.
     pn_to_lid_user = {pn_jid: lid_user for lid_user, pn_jid in lidmap.items()}
-
-    def canonical(jid: str) -> str:
-        # Groups, LIDs, and anything non-PN — leave alone.
-        if not jid.endswith("@s.whatsapp.net"):
-            return jid
-        local = jid.split("@")[0]
-        if local.isdigit() and len(local) > 13:
-            # Polluted: 14+ digits is never a real phone number, always a LID.
-            return f"{local}@lid"
-        lid_user = pn_to_lid_user.get(jid)
-        if lid_user:
-            return f"{lid_user}@lid"
-        return jid  # legitimate PN with no known LID twin — leave it
+    canonical = lambda j: canonical_jid(j, lidmap_inverted=pn_to_lid_user)
 
     # --- chats.json ----------------------------------------------------
     new_chats: dict[str, dict] = {}
@@ -735,6 +722,213 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     )
 
 
+@cli.command()
+@click.argument("peer")
+@click.argument("text")
+def send(peer: str, text: str) -> None:
+    """Send a text message to a 1:1 chat.
+
+    ``peer`` is a name (resolved against your cached chats, same matcher
+    as ``wa read``) or a full JID like ``33629442167@s.whatsapp.net``.
+    The recipient's primary device is targeted; multi-device fan-out
+    (delivering to the recipient's Web/desktop clients as well) is not
+    yet implemented, but for normal phone-to-phone chats that's not what
+    you observe — the recipient's phone receives and rebroadcasts.
+
+    Requires an existing Signal session with the peer. After a `wa sync`
+    you'll have sessions with everyone you've recently exchanged
+    messages with. For first-contact sends, pre-key bundle fetch is not
+    yet wired up.
+
+    \b
+    Examples:
+      wa send 33629442167@s.whatsapp.net "test from CLI"
+      wa send pierre "hi"
+    """
+    dev = Device.load()
+    if dev is None or not dev.is_paired():
+        click.echo("not paired — run `login` first", err=True)
+        raise SystemExit(1)
+
+    from wa.cache import find_chat
+
+    matches = find_chat(peer)
+    if not matches and "@" in peer:
+        # Bare JID — accept as-is.
+        peer_jid = peer
+    elif not matches:
+        click.echo(f"no chat matching {peer!r}", err=True)
+        raise SystemExit(1)
+    else:
+        # Prefer exact name match; otherwise pick the most recent.
+        exact = [m for m in matches if m[1].get("name", "").lower() == peer.lower()]
+        peer_jid = (exact[0][0] if exact else matches[0][0])
+        if len(matches) > 1 and not exact:
+            click.echo(
+                f"ambiguous: {len(matches)} matches; sending to most recent "
+                f"({peer_jid}). Pass a full JID to be explicit.",
+                err=True,
+            )
+
+    if peer_jid.endswith("@g.us"):
+        click.echo("group sends are not implemented yet (needs Sender Keys)", err=True)
+        raise SystemExit(1)
+
+    asyncio.run(_send_async(dev, peer_jid, text))
+
+
+async def _send_async(device: Device, peer_jid: str, text: str) -> None:
+    """Single-shot send: login, encrypt, transmit, await ack, exit."""
+    import secrets
+    import time as _time
+
+    from wa.cache import CachedMessage, append_messages, upsert_chat
+    from wa.peerreq import _string_field, pad_for_signal
+
+    log = logging.getLogger("send")
+
+    # Message proto: a plain text message is `{conversation: text}`,
+    # which is field 1 (string) inside waE2E.Message. We hand-encode
+    # rather than vendor the .proto for this one field.
+    message_proto = _string_field(1, text)
+    padded = pad_for_signal(message_proto)
+
+    peer_local, _, peer_server = peer_jid.partition("@")
+    if not peer_server:
+        click.echo(f"malformed peer JID: {peer_jid!r}", err=True)
+        raise SystemExit(1)
+
+    # Encryption identity is normally the same as the wire-level address.
+    # Self-send is the exception: the active session with your own device
+    # is keyed under your LID, while the stanza is addressed to your PN
+    # (mirroring the pattern used for the on-demand history channel).
+    own_pn = JID.parse(device.jid)
+    own_lid = JID.parse(device.lid) if device.lid else None
+    is_self = peer_local == own_pn.user or (own_lid and peer_local == own_lid.user)
+    if is_self and own_lid is not None:
+        session_user = own_lid.user
+    else:
+        session_user = peer_local
+
+    async with FrameSocket() as fs:
+        await fs.connect()
+        try:
+            ns = await do_handshake(fs, device, build_login_payload(device))
+        except Exception as e:
+            click.echo(click.style(f"handshake failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+        # Wait for <success/>.
+        while True:
+            try:
+                ct = await fs.recv(timeout=15.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                click.echo(click.style("no <success/> received", fg="red"), err=True)
+                raise SystemExit(1)
+            node = decode_node(ns.decrypt_frame(ct))
+            if node.tag == "success":
+                break
+            if node.tag == "failure":
+                click.echo(click.style(f"login rejected: {_pretty(node)}", fg="red"), err=True)
+                raise SystemExit(1)
+
+        # Active IQ — needed so the server treats us as a live client and
+        # routes our outbound message instead of buffering it.
+        active = Node(
+            tag="iq",
+            attrs={
+                "to": JID(server="s.whatsapp.net"),
+                "type": "set",
+                "id": "send-active",
+                "xmlns": "passive",
+            },
+            content=[Node(tag="active")],
+        )
+        await fs.send(ns.encrypt_frame(encode_node(active)))
+        active_deadline = asyncio.get_event_loop().time() + 5.0
+        while asyncio.get_event_loop().time() < active_deadline:
+            try:
+                ct = await fs.recv(timeout=0.5)
+            except (asyncio.TimeoutError, ConnectionError):
+                break
+            n = decode_node(ns.decrypt_frame(ct))
+            if n.tag == "iq" and n.attrs.get("id") == "send-active":
+                break
+
+        # Encrypt to the peer's primary device (device 0). Throws if no
+        # session exists; surface a clear hint pointing at `wa sync`.
+        signal = SignalSession(device)
+        try:
+            ciphertext, kind = signal.encrypt_msg(session_user, 0, padded)
+        except Exception as e:
+            click.echo(
+                click.style(
+                    f"no Signal session with {session_user}:0 — {e}\n"
+                    f"  hint: run `wa sync` after the peer sends you anything "
+                    f"(messages, typing indicator, presence), then retry.",
+                    fg="red",
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
+
+        # WhatsApp outbound message IDs: uppercase hex, prefixed `3EB0`
+        # for client-generated. Server-side filtering drops off-format IDs.
+        msg_id = "3EB0" + secrets.token_hex(9).upper()
+        # Stanza addressing: PN form when sending to self (matches the
+        # session-vs-address split above); otherwise the peer's JID as-is.
+        stanza_to = (
+            JID(user=own_pn.user, server="s.whatsapp.net")
+            if is_self
+            else JID(user=peer_local, server=peer_server)
+        )
+        stanza = Node(
+            tag="message",
+            attrs={"to": stanza_to, "type": "text", "id": msg_id},
+            content=[
+                Node(tag="enc", attrs={"v": "2", "type": kind}, content=ciphertext),
+            ],
+        )
+        await fs.send(ns.encrypt_frame(encode_node(stanza)))
+        log.info("sent %s message id=%s to=%s (%d-byte enc)", kind, msg_id, peer_jid, len(ciphertext))
+
+        # Await ack. Server returns `<ack class="message" id="<msg_id>"/>`
+        # to confirm delivery to its queue.
+        ack_deadline = asyncio.get_event_loop().time() + 15.0
+        while asyncio.get_event_loop().time() < ack_deadline:
+            try:
+                ct = await fs.recv(timeout=max(0.1, ack_deadline - asyncio.get_event_loop().time()))
+            except (asyncio.TimeoutError, ConnectionError):
+                break
+            try:
+                node = decode_node(ns.decrypt_frame(ct))
+            except Exception:
+                continue
+            if node.tag == "ack" and node.attrs.get("id") == msg_id:
+                ts = int(_time.time())
+                append_messages([
+                    CachedMessage(
+                        ts=ts,
+                        chat=peer_jid,
+                        sender=f"{own_pn.user}@s.whatsapp.net",
+                        sender_name="me",
+                        text=text,
+                        from_me=True,
+                        msg_id=msg_id,
+                    )
+                ])
+                upsert_chat(peer_jid, last_ts=ts)
+                click.echo(click.style(f"sent: {msg_id}", fg="green"))
+                return
+            log.debug("ignoring frame while waiting for ack: %s", node.tag)
+        click.echo(
+            click.style(
+                "no ack within 15s — message may or may not have been queued",
+                fg="yellow",
+            ),
+            err=True,
+        )
+
+
 async def _login_async(device: Device) -> None:
     # Fast path for already-paired devices: skip the QR dance and go
     # straight to the login-handshake. This is also what runs after a
@@ -1058,9 +1252,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             # Preserve the original server on the JID. Hardcoding
             # `@s.whatsapp.net` for non-group chats was wrong: many DMs in
             # the post-2024 WhatsApp world come from `@lid` identifiers
-            # (15-digit privacy-preserving IDs), and forcing them into the
-            # PN namespace makes them un-resolvable against `contacts.json`
-            # and `lidmap.json`, so they show up as `(unnamed)` forever.
+            # (15-digit privacy-preserving IDs).
             if isinstance(from_jid, JID) and from_jid.server == "g.us":
                 chat_jid = f"{from_jid.user}@g.us"
             elif isinstance(from_jid, JID):
@@ -1071,6 +1263,14 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                 sender_jid = f"{sender.user}@{sender.server}"
             else:
                 sender_jid = f"{jid_user}@s.whatsapp.net"
+            # Auto-merge: fold any wrongly-namespaced PN entry into its
+            # canonical @lid twin before persisting, so the cache never
+            # accumulates the kind of duplicates that `wa migrate` cleans
+            # up retroactively.
+            from wa.cache import canonical_jid
+
+            chat_jid = canonical_jid(chat_jid)
+            sender_jid = canonical_jid(sender_jid)
             ts_attr = node.attrs.get("t", 0)
             try:
                 ts = int(ts_attr)
