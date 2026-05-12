@@ -138,14 +138,20 @@ def upsert_chat(jid: str, name: str = "", last_ts: int = 0) -> None:
 
 
 def find_chat(query: str) -> list[tuple[str, dict]]:
-    """Return chats whose JID or name contains ``query`` (case-insensitive).
+    """Return chats whose JID, app-state name, or contact name contains ``query``.
 
-    Sorted by last_ts descending so the most active match comes first.
+    DMs have no app-state name (WhatsApp doesn't sync address-book labels
+    to linked devices), so we also match against ``contacts.json`` — that's
+    where ``import-contacts`` and pushname syncs land. Sorted by last_ts
+    descending so the most active match comes first.
     """
     q = query.lower()
+    chats = load_chats()
+    contacts = load_contacts()
     matches = []
-    for jid, info in load_chats().items():
-        haystack = (jid + " " + (info.get("name") or "")).lower()
+    for jid, info in chats.items():
+        contact_name = contacts.get(jid, "")
+        haystack = (jid + " " + (info.get("name") or "") + " " + contact_name).lower()
         if q in haystack:
             matches.append((jid, info))
     matches.sort(key=lambda kv: kv[1].get("last_ts", 0), reverse=True)
