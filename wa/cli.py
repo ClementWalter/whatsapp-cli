@@ -16,7 +16,7 @@ from pathlib import Path
 
 import click
 
-from wa.clientpayload import build_login_payload, build_registration_payload
+from wa.clientpayload import build_login_payload, build_registration_payload, device_label
 from wa.handshake import do_handshake
 from wa.pair import (
     build_pair_device_ack,
@@ -52,6 +52,37 @@ def _pretty(node: Node, indent: int = 0) -> str:
         lines.append(_pretty(child, indent + 1))
     lines.append(f"{pad}</{node.tag}>")
     return "\n".join(lines)
+
+
+async def _send_presence_available(fs, ns, device: Device) -> None:
+    """Announce the companion as online on every connect.
+
+    Without this stanza, the server treats the device as a passive
+    background companion: the active-IQ flips the routing flag but
+    never advances the phone's "last activity" timestamp or resets
+    the ~14-day linked-device retention timer. A device that only
+    ever does Noise + active-IQ + drain looks dormant and gets its
+    offline mailbox purged. Sending presence once per connect is
+    what real clients (whatsmeow, web.whatsapp.com) do and is what
+    keeps the link healthy across long-running CLI usage.
+
+    ``name`` is the public display name the server caches for this
+    device. We prefer the persisted ``push_name`` (set if the user
+    or app-state sync has populated it); otherwise we use the same
+    host-derived label as the companion's ``os`` field so the two
+    stay consistent on the phone's UI.
+    """
+    name = device.push_name or device_label()
+    presence = Node(
+        tag="presence",
+        attrs={"name": name, "type": "available"},
+    )
+    try:
+        await fs.send(ns.encrypt_frame(encode_node(presence)))
+    except Exception as e:
+        # Presence is best-effort housekeeping — never fail the user
+        # action over it.
+        logging.getLogger("login").debug("presence send failed: %s", e)
 
 
 def _setup_logging(debug: bool) -> None:
@@ -1195,6 +1226,7 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             n = decode_node(ns.decrypt_frame(ct))
             if n.tag == "iq" and n.attrs.get("id") == "send-active":
                 break
+        await _send_presence_available(fs, ns, device)
 
         # For self-sends we query usync with our LID JID so the response
         # is a list of LID-form devices — matching the LID-addressed
@@ -1542,6 +1574,7 @@ async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
             n = decode_node(ns.decrypt_frame(ct))
             if n.tag == "iq" and n.attrs.get("id") == "send-active":
                 break
+        await _send_presence_available(fs, ns, device)
 
         # 1. Group participants + addressing mode.
         try:
@@ -2553,6 +2586,7 @@ async def _post_success(
             log.debug("active state confirmed")
             break
         log.debug("pre-active drain: %s id=%s", n.tag, n.attrs.get("id"))
+    await _send_presence_available(fs, ns, device)
     if fetch_groups:
         click.echo(
             click.style(
@@ -2748,6 +2782,7 @@ async def _extend_chat(chat_jid: str, count: int) -> int:
             n = decode_node(ns.decrypt_frame(ct))
             if n.tag == "iq" and n.attrs.get("id") == "ext-act":
                 break
+        await _send_presence_available(fs, ns, device)
 
         # Encrypt to our own *LID* device 0 (whatsmeow does the same — peer
         # messages go to the LID identity, even though the wire-level `to`

@@ -14,12 +14,42 @@ import struct
 
 import logging
 import re
+import socket
+import subprocess
+import sys
 import urllib.request
 
 from wa.proto import waCompanionReg_pb2, waWa6_pb2
 from wa.store import Device
 
 log = logging.getLogger(__name__)
+
+
+def device_label() -> str:
+    """Identifier shown on the phone's Linked Devices list and used as the
+    presence ``name`` attribute.
+
+    Shape: ``whatsapp-cli-<host>``, where ``<host>`` is the macOS Computer
+    Name when available (user-friendly, matches what System Settings shows)
+    and falls back to the hostname elsewhere. A non-generic name makes it
+    possible to distinguish multiple CLI installs on different machines
+    paired to the same WhatsApp account.
+    """
+    host = ""
+    if sys.platform == "darwin":
+        try:
+            r = subprocess.run(
+                ["scutil", "--get", "ComputerName"],
+                capture_output=True, text=True, timeout=2,
+            )
+            if r.returncode == 0:
+                host = r.stdout.strip()
+        except Exception:
+            pass
+    if not host:
+        host = socket.gethostname()
+    host = host.removesuffix(".local")
+    return f"whatsapp-cli-{host}" if host else "whatsapp-cli"
 
 # Fallback WA Web version if we can't fetch a fresh one. Sync periodically
 # with whatsmeow's ``waVersion`` in store/clientpayload.go; a stale tuple
@@ -70,7 +100,10 @@ ECC_DJB_TYPE = 0x05
 
 def _device_props_bytes() -> bytes:
     props = waCompanionReg_pb2.DeviceProps()
-    props.os = "whatsapp-cli"
+    # `os` is what the phone displays for this companion in
+    # Settings → Linked Devices. Including the host makes the entry
+    # identifiable when more than one machine is paired.
+    props.os = device_label()
     props.version.primary = 0
     props.version.secondary = 1
     props.version.tertiary = 0
