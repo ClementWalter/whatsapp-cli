@@ -1518,14 +1518,18 @@ async def _send_async(
             if kind == "pkmsg":
                 any_pkmsg = True
             # Wire identity matches what we'll address the stanza with:
-            # LID for self-sends, PN for peer sends.
+            # LID for self-sends, PN for peer sends. Media messages carry a
+            # `mediatype` on every <enc> so the recipient treats the
+            # decrypted payload as media (whatsmeow sets this whenever the
+            # message has a media type — without it documents don't render).
+            enc_attrs = {"v": "2", "type": kind}
+            if doc_path:
+                enc_attrs["mediatype"] = "document"
             participant_children.append(
                 Node(
                     tag="to",
                     attrs={"jid": dev},
-                    content=[
-                        Node(tag="enc", attrs={"v": "2", "type": kind}, content=ct)
-                    ],
+                    content=[Node(tag="enc", attrs=enc_attrs, content=ct)],
                 )
             )
         if not participant_children:
@@ -1875,9 +1879,14 @@ async def _send_group_async(
             "phash": phash,
             "addressing_mode": addressing_mode,
         }
+        skmsg_attrs = {"v": "2", "type": "skmsg"}
+        if doc_path:
+            # Media payloads carry `mediatype` on the skmsg <enc> too, so
+            # recipients render the decrypted document.
+            skmsg_attrs["mediatype"] = "document"
         content_nodes: list[Node] = [
             Node(tag="participants", content=participant_children),
-            Node(tag="enc", attrs={"v": "2", "type": "skmsg"}, content=skmsg_ct),
+            Node(tag="enc", attrs=skmsg_attrs, content=skmsg_ct),
         ]
         if any_pkmsg and device.account:
             content_nodes.append(Node(tag="device-identity", content=device.account))
