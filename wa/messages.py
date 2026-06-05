@@ -9,12 +9,14 @@ mirror whatsmeow's ``WAWebProtobufsE2E`` bindings:
     31 deviceSentMessage (length-delimited)
 
 ``DocumentMessage``:
-    1  URL (string)            7  mediaKey (bytes)
-    2  mimetype (string)       8  fileName (string)
-    3  title (string)          9  fileEncSHA256 (bytes)
-    4  fileSHA256 (bytes)      10 directPath (string)
-    5  fileLength (uint64)     11 mediaKeyTimestamp (int64, seconds)
-    6  pageCount (uint32)      20 caption (string)
+    1  URL (string)            9  fileEncSHA256 (bytes)
+    2  mimetype (string)       10 directPath (string)
+    3  title (string)          11 mediaKeyTimestamp (int64, seconds)
+    4  fileSHA256 (bytes)      16 jpegThumbnail (bytes)
+    5  fileLength (uint64)     18 thumbnailHeight (uint32)
+    6  pageCount (uint32)      19 thumbnailWidth (uint32)
+    7  mediaKey (bytes)        20 caption (string)
+    8  fileName (string)
 """
 
 from __future__ import annotations
@@ -39,6 +41,9 @@ class DocumentInfo:
     media_key_timestamp: int
     caption: str | None = None
     title: str | None = None
+    jpeg_thumbnail: bytes | None = None  # inline JPEG preview WhatsApp renders
+    thumbnail_width: int | None = None
+    thumbnail_height: int | None = None
 
 
 def _bytes_field(field_num: int, b: bytes) -> bytes:
@@ -59,6 +64,12 @@ def build_document_message(doc: DocumentInfo) -> bytes:
     body += _bytes_field(9, doc.file_enc_sha256)
     body += _string_field(10, doc.direct_path)
     body += _varint_field(11, doc.media_key_timestamp)
+    if doc.jpeg_thumbnail:
+        body += _bytes_field(16, doc.jpeg_thumbnail)
+        if doc.thumbnail_height:
+            body += _varint_field(18, doc.thumbnail_height)
+        if doc.thumbnail_width:
+            body += _varint_field(19, doc.thumbnail_width)
     if doc.caption:
         body += _string_field(20, doc.caption)
     return body

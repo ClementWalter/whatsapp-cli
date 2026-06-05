@@ -80,6 +80,27 @@ def test_document_message_caption(doc):
     assert fields[20][0].decode() == "see attached"
 
 
+def test_document_message_no_thumbnail_field_when_absent(doc):
+    fields = decode_fields(build_document_message(doc))
+    assert 16 not in fields
+
+
+def test_document_message_jpeg_thumbnail(doc):
+    with_thumb = DocumentInfo(
+        **{**doc.__dict__, "jpeg_thumbnail": b"\xff\xd8jpeg", "thumbnail_width": 400, "thumbnail_height": 300}
+    )
+    fields = decode_fields(build_document_message(with_thumb))
+    assert fields[16][0] == b"\xff\xd8jpeg"
+
+
+def test_document_message_thumbnail_dimensions(doc):
+    with_thumb = DocumentInfo(
+        **{**doc.__dict__, "jpeg_thumbnail": b"\xff\xd8jpeg", "thumbnail_width": 400, "thumbnail_height": 300}
+    )
+    fields = decode_fields(build_document_message(with_thumb))
+    assert (fields[19][0], fields[18][0]) == (400, 300)
+
+
 def test_document_message_caption_omitted_when_absent(doc):
     no_caption = DocumentInfo(**{**doc.__dict__, "caption": None})
     fields = decode_fields(build_document_message(no_caption))
