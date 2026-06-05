@@ -25,54 +25,41 @@ import tempfile
 
 log = logging.getLogger(__name__)
 
-# The CDN thumbnail is shown crisp by both clients; the inline one is only a
-# placeholder until it loads, so it stays small (a few KB inside the message).
-_HIRES_WIDTH = 800
-_INLINE_WIDTH = 280
+# Target geometry for the embedded preview. Kept small — the thumbnail travels
+# inline inside the encrypted message, so it must stay a few KB, not hundreds.
+_MAX_WIDTH = 400
 _MAX_ASPECT = 4 / 3  # crop tall pages (articles) to a portrait preview
 
 
-def make_thumbnail(path: str, mimetype: str) -> tuple[bytes, bytes, int, int] | None:
-    """Return ``(hires_jpeg, inline_jpeg, width, height)`` for *path*, or ``None``.
+def make_thumbnail(path: str, mimetype: str) -> tuple[bytes, int, int] | None:
+    """Return ``(jpeg_bytes, width, height)`` for *path*, or ``None``.
 
-    *hires_jpeg* (≈800px) is uploaded to the CDN as the document's thumbnail;
-    *inline_jpeg* (≈280px) is embedded in the message as the placeholder.
-    *width*/*height* describe the hi-res image. Never raises — any failure
-    (no renderer, bad file) degrades to ``None`` and the caller sends no preview.
+    Never raises — rasterisation and encoding failures degrade to ``None``.
     """
     try:
         raw = _rasterise(path, mimetype)
         if raw is None:
             return None
-        return _encode_thumbnails(raw)
+        return _to_jpeg_thumbnail(raw)
     except Exception as e:  # best-effort: a preview is never worth failing a send
         log.debug("thumbnail generation failed for %s: %s", path, e)
         return None
 
 
-def _encode_thumbnails(raw_image: bytes) -> tuple[bytes, bytes, int, int]:
-    """Downscale + top-crop a rendered image into hi-res and inline JPEGs."""
+def _to_jpeg_thumbnail(raw_image: bytes) -> tuple[bytes, int, int]:
+    """Downscale + top-crop a rendered image into a small JPEG."""
     from PIL import Image
 
     im = Image.open(io.BytesIO(raw_image)).convert("RGB")
-    if im.width > _HIRES_WIDTH:
-        h = round(im.height * _HIRES_WIDTH / im.width)
-        im = im.resize((_HIRES_WIDTH, h))
+    if im.width > _MAX_WIDTH:
+        h = round(im.height * _MAX_WIDTH / im.width)
+        im = im.resize((_MAX_WIDTH, h))
     max_h = round(im.width * _MAX_ASPECT)
     if im.height > max_h:
         im = im.crop((0, 0, im.width, max_h))  # keep the top (title + lead)
-
-    hires = io.BytesIO()
-    im.save(hires, format="JPEG", quality=82, optimize=True)
-
-    inline_im = im
-    if im.width > _INLINE_WIDTH:
-        h = round(im.height * _INLINE_WIDTH / im.width)
-        inline_im = im.resize((_INLINE_WIDTH, h))
-    inline = io.BytesIO()
-    inline_im.save(inline, format="JPEG", quality=60, optimize=True)
-
-    return hires.getvalue(), inline.getvalue(), im.width, im.height
+    buf = io.BytesIO()
+    im.save(buf, format="JPEG", quality=72, optimize=True)
+    return buf.getvalue(), im.width, im.height
 
 
 def _rasterise(path: str, mimetype: str) -> bytes | None:
@@ -94,9 +81,7 @@ def _render_html(path: str) -> bytes | None:
             out = fh.name
         try:
             res = subprocess.run(
-                # Render wide so the downscaled thumbnail stays crisp on a
-                # desktop preview (we only ever scale down from here).
-                [exe, "--quiet", "--format", "jpeg", "--width", "800",
+                [exe, "--quiet", "--format", "jpeg", "--width", "480",
                  "--quality", "90", path, out],
                 capture_output=True,
                 timeout=60,
@@ -114,7 +99,7 @@ def _render_html(path: str) -> bytes | None:
         try:
             res = subprocess.run(
                 [chrome, "--headless=new", "--disable-gpu", "--hide-scrollbars",
-                 "--window-size=800,1067", f"--screenshot={out}",
+                 "--window-size=480,640", f"--screenshot={out}",
                  f"file://{os.path.abspath(path)}"],
                 capture_output=True,
                 timeout=60,
@@ -135,7 +120,7 @@ def _render_pdf(path: str) -> bytes | None:
             prefix = os.path.join(d, "page")
             res = subprocess.run(
                 [exe, "-jpeg", "-f", "1", "-l", "1", "-singlefile",
-                 "-scale-to", "1000", path, prefix],
+                 "-scale-to", "600", path, prefix],
                 capture_output=True,
                 timeout=60,
             )

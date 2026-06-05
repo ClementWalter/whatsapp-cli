@@ -101,32 +101,6 @@ def test_document_message_thumbnail_dimensions(doc):
     assert (fields[19][0], fields[18][0]) == (400, 300)
 
 
-def test_document_message_cdn_thumbnail_direct_path(doc):
-    with_cdn = DocumentInfo(
-        **{
-            **doc.__dict__,
-            "thumbnail_direct_path": "/v/t62/thumb.enc",
-            "thumbnail_sha256": b"t" * 32,
-            "thumbnail_enc_sha256": b"u" * 32,
-        }
-    )
-    fields = decode_fields(build_document_message(with_cdn))
-    assert fields[13][0].decode() == "/v/t62/thumb.enc"
-
-
-def test_document_message_cdn_thumbnail_hashes(doc):
-    with_cdn = DocumentInfo(
-        **{
-            **doc.__dict__,
-            "thumbnail_direct_path": "/v/t62/thumb.enc",
-            "thumbnail_sha256": b"t" * 32,
-            "thumbnail_enc_sha256": b"u" * 32,
-        }
-    )
-    fields = decode_fields(build_document_message(with_cdn))
-    assert (fields[14][0], fields[15][0]) == (b"t" * 32, b"u" * 32)
-
-
 def test_document_message_caption_omitted_when_absent(doc):
     no_caption = DocumentInfo(**{**doc.__dict__, "caption": None})
     fields = decode_fields(build_document_message(no_caption))
