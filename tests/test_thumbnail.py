@@ -20,27 +20,37 @@ def wide_png(tmp_path):
     return str(p)
 
 
-def test_image_thumbnail_returns_jpeg(wide_png):
-    jpg, _w, _h = make_thumbnail(wide_png, "image/png")
-    assert jpg[:2] == b"\xff\xd8"  # JPEG SOI marker
+def test_hires_thumbnail_is_jpeg(wide_png):
+    hires, _inline, _w, _h = make_thumbnail(wide_png, "image/png")
+    assert hires[:2] == b"\xff\xd8"  # JPEG SOI marker
 
 
-def test_image_thumbnail_capped_to_max_width(wide_png):
-    _jpg, w, _h = make_thumbnail(wide_png, "image/png")
-    assert w == 400
+def test_inline_thumbnail_is_jpeg(wide_png):
+    _hires, inline, _w, _h = make_thumbnail(wide_png, "image/png")
+    assert inline[:2] == b"\xff\xd8"
 
 
-def test_image_thumbnail_cropped_to_aspect(wide_png):
+def test_hires_thumbnail_capped_to_max_width(wide_png):
+    _hires, _inline, w, _h = make_thumbnail(wide_png, "image/png")
+    assert w == 800
+
+
+def test_thumbnail_cropped_to_aspect(wide_png):
     # Tall source is top-cropped to at most 4:3 (height <= width * 4/3).
-    _jpg, w, h = make_thumbnail(wide_png, "image/png")
+    _hires, _inline, w, h = make_thumbnail(wide_png, "image/png")
     assert h <= round(w * 4 / 3)
 
 
-def test_image_thumbnail_decodes(wide_png):
+def test_inline_thumbnail_smaller_than_hires(wide_png):
+    hires, inline, _w, _h = make_thumbnail(wide_png, "image/png")
+    assert len(inline) < len(hires)
+
+
+def test_hires_thumbnail_decodes_to_reported_size(wide_png):
     from PIL import Image
 
-    jpg, w, h = make_thumbnail(wide_png, "image/png")
-    im = Image.open(io.BytesIO(jpg))
+    hires, _inline, w, h = make_thumbnail(wide_png, "image/png")
+    im = Image.open(io.BytesIO(hires))
     assert im.size == (w, h)
 
 
