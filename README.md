@@ -8,6 +8,7 @@ wa sync                 # catch up
 wa chats                # 1 row per conversation
 wa read "alice"         # show a thread
 wa send "alice" "hi"    # send a text (1:1 or group)
+wa send "alice" --doc report.pdf   # share a document (PDF or any file)
 ```
 
 Not the Cloud Business API (which cannot read personal chats), not a Playwright
@@ -60,6 +61,7 @@ wa read "alice" --match 2            # disambiguate when multiple "alices" match
 wa read 33123456789@s.whatsapp.net   # exact JID, never ambiguous
 wa send "alice" "running 10 min late"
 wa send "Football" "see you at 7pm"  # groups work too
+wa send "alice" "see attached" --doc report.pdf   # document with a caption
 wa import-contacts                   # macOS only: pull names from Contacts.app
 ```
 
