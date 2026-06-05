@@ -12,11 +12,16 @@ mirror whatsmeow's ``WAWebProtobufsE2E`` bindings:
     1  URL (string)            9  fileEncSHA256 (bytes)
     2  mimetype (string)       10 directPath (string)
     3  title (string)          11 mediaKeyTimestamp (int64, seconds)
-    4  fileSHA256 (bytes)      16 jpegThumbnail (bytes)
-    5  fileLength (uint64)     18 thumbnailHeight (uint32)
-    6  pageCount (uint32)      19 thumbnailWidth (uint32)
-    7  mediaKey (bytes)        20 caption (string)
-    8  fileName (string)
+    4  fileSHA256 (bytes)      13 thumbnailDirectPath (string)
+    5  fileLength (uint64)     14 thumbnailSHA256 (bytes)
+    6  pageCount (uint32)      15 thumbnailEncSHA256 (bytes)
+    7  mediaKey (bytes)        16 jpegThumbnail (bytes)
+    8  fileName (string)       18 thumbnailHeight / 19 thumbnailWidth (uint32)
+                               20 caption (string)
+
+The CDN thumbnail (13/14/15) is decrypted with the document's own mediaKey,
+so no separate key field exists; only the inline jpegThumbnail (16) is shown
+until that higher-res thumbnail loads.
 """
 
 from __future__ import annotations
@@ -44,6 +49,12 @@ class DocumentInfo:
     jpeg_thumbnail: bytes | None = None  # inline JPEG preview WhatsApp renders
     thumbnail_width: int | None = None
     thumbnail_height: int | None = None
+    # Higher-res thumbnail uploaded to the CDN (decrypted with this document's
+    # mediaKey). Needed for the mobile app to show a preview, and for a crisp
+    # one on desktop instead of the blurry inline placeholder.
+    thumbnail_direct_path: str | None = None
+    thumbnail_sha256: bytes | None = None
+    thumbnail_enc_sha256: bytes | None = None
 
 
 def _bytes_field(field_num: int, b: bytes) -> bytes:
@@ -64,6 +75,10 @@ def build_document_message(doc: DocumentInfo) -> bytes:
     body += _bytes_field(9, doc.file_enc_sha256)
     body += _string_field(10, doc.direct_path)
     body += _varint_field(11, doc.media_key_timestamp)
+    if doc.thumbnail_direct_path and doc.thumbnail_sha256 and doc.thumbnail_enc_sha256:
+        body += _string_field(13, doc.thumbnail_direct_path)
+        body += _bytes_field(14, doc.thumbnail_sha256)
+        body += _bytes_field(15, doc.thumbnail_enc_sha256)
     if doc.jpeg_thumbnail:
         body += _bytes_field(16, doc.jpeg_thumbnail)
         if doc.thumbnail_height:

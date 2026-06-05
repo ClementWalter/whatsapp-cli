@@ -1219,18 +1219,33 @@ async def _upload_document(
     file_name = os.path.basename(file_path)
     mimetype = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
-    thumb = jpg = thumb_w = thumb_h = None
+    hires = inline_jpg = thumb_w = thumb_h = None
     if make_thumb:
         from wa.thumbnail import make_thumbnail
 
         thumb = make_thumbnail(file_path, mimetype)
         if thumb is not None:
-            jpg, thumb_w, thumb_h = thumb
-            log.info("embedded %dx%d thumbnail (%d bytes)", thumb_w, thumb_h, len(jpg))
+            hires, inline_jpg, thumb_w, thumb_h = thumb
 
     enc = encrypt_media(raw, "document")
     hosts, auth = await _fetch_media_conn(fs, ns)
     url, direct_path = upload_media(enc, hosts, auth, "document")
+
+    # Upload the hi-res thumbnail as its own CDN blob, encrypted under the
+    # document's mediaKey (WhatsApp decrypts it with the message key). Without
+    # this the mobile app shows no preview and desktop only the blurry inline.
+    thumb_direct_path = thumb_sha = thumb_enc_sha = None
+    if hires is not None:
+        try:
+            tenc = encrypt_media(hires, "thumbnail-link", media_key=enc.media_key)
+            _turl, thumb_direct_path = upload_media(tenc, hosts, auth, "thumbnail-link")
+            thumb_sha, thumb_enc_sha = tenc.file_sha256, tenc.file_enc_sha256
+            log.info(
+                "uploaded %dx%d thumbnail (inline %d B, cdn %d B)",
+                thumb_w, thumb_h, len(inline_jpg), len(hires),
+            )
+        except Exception as e:  # keep the inline placeholder, drop the CDN ref
+            log.warning("thumbnail upload failed (%s); sending inline-only preview", e)
 
     doc = DocumentInfo(
         url=url,
@@ -1244,9 +1259,12 @@ async def _upload_document(
         media_key_timestamp=int(_time.time()),
         caption=caption,
         title=file_name,
-        jpeg_thumbnail=jpg,
+        jpeg_thumbnail=inline_jpg,
         thumbnail_width=thumb_w,
         thumbnail_height=thumb_h,
+        thumbnail_direct_path=thumb_direct_path,
+        thumbnail_sha256=thumb_sha,
+        thumbnail_enc_sha256=thumb_enc_sha,
     )
     log.info("uploaded document %s (%d bytes, %s)", file_name, enc.file_length, mimetype)
     summary = f"[document: {file_name}]" + (f" {caption}" if caption else "")
