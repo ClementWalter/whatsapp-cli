@@ -772,7 +772,13 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     default=None,
     help="Attach a file (any type) as a document; TEXT becomes its caption.",
 )
-def send(peer: str, text: str, doc_path: str | None) -> None:
+@click.option(
+    "--no-thumbnail",
+    "no_thumbnail",
+    is_flag=True,
+    help="Skip generating the inline preview thumbnail for --doc.",
+)
+def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool) -> None:
     """Send a text message — or a document — to a 1:1 chat or group.
 
     ``peer`` is a name (resolved against your cached chats, same substring
@@ -833,11 +839,12 @@ def send(peer: str, text: str, doc_path: str | None) -> None:
 
     from wa.cache import connection_lock
 
+    make_thumb = not no_thumbnail
     with connection_lock():
         if peer_jid.endswith("@g.us"):
-            asyncio.run(_send_group_async(dev, peer_jid, text, doc_path))
+            asyncio.run(_send_group_async(dev, peer_jid, text, doc_path, make_thumb))
         else:
-            asyncio.run(_send_async(dev, peer_jid, text, doc_path))
+            asyncio.run(_send_async(dev, peer_jid, text, doc_path, make_thumb))
 
 
 def _phash(devices: list[JID]) -> str:
@@ -1185,12 +1192,14 @@ async def _fetch_media_conn(fs: FrameSocket, ns) -> tuple[list[str], str]:
 
 
 async def _upload_document(
-    fs: FrameSocket, ns, file_path: str, caption: str | None
+    fs: FrameSocket, ns, file_path: str, caption: str | None, make_thumb: bool = True
 ):
     """Encrypt + upload a file; return ``(DocumentInfo, cache_summary)``.
 
     Shared by the DM and group send paths — both attach the same
-    ``DocumentMessage`` to their (differently-encrypted) stanzas.
+    ``DocumentMessage`` to their (differently-encrypted) stanzas. When
+    *make_thumb* is set we also embed an inline JPEG preview (best-effort;
+    WhatsApp only auto-previews PDFs/images server-side, never HTML).
     """
     import mimetypes
     import os
@@ -1210,6 +1219,15 @@ async def _upload_document(
     file_name = os.path.basename(file_path)
     mimetype = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
 
+    thumb = jpg = thumb_w = thumb_h = None
+    if make_thumb:
+        from wa.thumbnail import make_thumbnail
+
+        thumb = make_thumbnail(file_path, mimetype)
+        if thumb is not None:
+            jpg, thumb_w, thumb_h = thumb
+            log.info("embedded %dx%d thumbnail (%d bytes)", thumb_w, thumb_h, len(jpg))
+
     enc = encrypt_media(raw, "document")
     hosts, auth = await _fetch_media_conn(fs, ns)
     url, direct_path = upload_media(enc, hosts, auth, "document")
@@ -1226,6 +1244,9 @@ async def _upload_document(
         media_key_timestamp=int(_time.time()),
         caption=caption,
         title=file_name,
+        jpeg_thumbnail=jpg,
+        thumbnail_width=thumb_w,
+        thumbnail_height=thumb_h,
     )
     log.info("uploaded document %s (%d bytes, %s)", file_name, enc.file_length, mimetype)
     summary = f"[document: {file_name}]" + (f" {caption}" if caption else "")
@@ -1238,6 +1259,7 @@ async def _prepare_document(
     file_path: str,
     caption: str | None,
     dsm_dest: str,
+    make_thumb: bool = True,
 ) -> tuple[bytes, bytes, str]:
     """DM variant: build both the peer plaintext and the own-device DSM wrap.
 
@@ -1245,7 +1267,7 @@ async def _prepare_document(
     """
     from wa.messages import build_document_dsm_plaintext, build_document_plaintext
 
-    doc, summary = await _upload_document(fs, ns, file_path, caption)
+    doc, summary = await _upload_document(fs, ns, file_path, caption, make_thumb)
     return (
         build_document_plaintext(doc),
         build_document_dsm_plaintext(doc, dsm_dest),
@@ -1254,7 +1276,11 @@ async def _prepare_document(
 
 
 async def _send_async(
-    device: Device, peer_jid: str, text: str, doc_path: str | None = None
+    device: Device,
+    peer_jid: str,
+    text: str,
+    doc_path: str | None = None,
+    make_thumb: bool = True,
 ) -> None:
     """Single-shot send: login, usync devices, encrypt per device, transmit, ack.
 
@@ -1395,7 +1421,7 @@ async def _send_async(
             # Encrypt + upload the file now that the socket is authenticated,
             # then build the document plaintext for the per-device loop below.
             msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
-                fs, ns, doc_path, text or None, dsm_dest
+                fs, ns, doc_path, text or None, dsm_dest, make_thumb
             )
 
         # For self-sends we query usync with our LID JID so the response
@@ -1676,7 +1702,11 @@ async def _fetch_group_members(
 
 
 async def _send_group_async(
-    device: Device, group_jid: str, text: str, doc_path: str | None = None
+    device: Device,
+    group_jid: str,
+    text: str,
+    doc_path: str | None = None,
+    make_thumb: bool = True,
 ) -> None:
     """Send a text or document message to a group via Sender Keys + skmsg.
 
@@ -1854,7 +1884,7 @@ async def _send_group_async(
         if doc_path:
             from wa.messages import build_document_plaintext
 
-            doc, cache_text = await _upload_document(fs, ns, doc_path, text or None)
+            doc, cache_text = await _upload_document(fs, ns, doc_path, text or None, make_thumb)
             message_plaintext = build_document_plaintext(doc)
         else:
             cache_text = text

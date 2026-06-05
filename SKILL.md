@@ -118,6 +118,12 @@ bin/wa send "Pierre" "see attached" --doc report.pdf   # document + caption
 delivers it as a document message; the mimetype is auto-detected (a `.pdf`
 arrives as `application/pdf`). `TEXT` is optional and becomes the caption.
 
+A preview thumbnail is generated and embedded automatically when possible —
+for images, PDFs (`pdftoppm`/`sips`), and HTML (`wkhtmltoimage` or headless
+Chrome) — so the document shows an inline preview in the chat (WhatsApp only
+auto-previews PDFs/images server-side, never HTML). Pass `--no-thumbnail` to
+skip it.
+
 **⚠️ A send is irreversible — there is no unsend/delete. When the exact
 target matters, always pass a full JID, never a fuzzy name or a bare
 number.** The matcher (`find_chat`) does a plain substring match against
