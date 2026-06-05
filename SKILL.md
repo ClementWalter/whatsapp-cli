@@ -107,9 +107,27 @@ a full JID. Supports 1:1 and group sends.
 
 ```bash
 bin/wa send "Pierre" "running late"
-bin/wa send 33123456789@s.whatsapp.net "test"     # self-send
+bin/wa send 33123456789@s.whatsapp.net "test"     # self-send (explicit JID)
 bin/wa send "Football" "see you at 7pm"           # group (Sender Keys)
 ```
+
+**⚠️ A send is irreversible — there is no unsend/delete. When the exact
+target matters, always pass a full JID, never a fuzzy name or a bare
+number.** The matcher (`find_chat`) does a plain substring match against
+`jid + app-state name + contact name`, so:
+
+- **A bare phone number can silently resolve to a GROUP, not a person.**
+  Legacy group JIDs embed a phone number (`<number>-<timestamp>@g.us`), so
+  `bin/wa send 33612345678 "..."` may match that group instead of the
+  contact. It picks the most-recent match and only warns on stderr.
+- **To message yourself, use the explicit PN JID
+  `<your-number>@s.whatsapp.net`** (e.g. `bin/wa send
+  33612345678@s.whatsapp.net "note to self"`). The bare number does **not**
+  reach your own DM: post-2024 self-chats are keyed by a `@lid` identity
+  that contains no phone digits, so a bare number can't match it and will
+  fall through to whatever group/contact happens to embed those digits.
+- A full JID with `@` that matches no cached chat is accepted as-is and
+  sent directly — this is the safe, unambiguous path.
 
 Limitations:
 - Text only. Media, replies, reactions, edits not implemented.
@@ -151,6 +169,8 @@ bin/wa sync && bin/wa read "<their name>" --limit 100
 ### "Send a message to <someone>"
 ```bash
 bin/wa send "<peer name or JID>" "<message text>"
+# When the exact target matters, pass a full JID (a bare number can match a group):
+bin/wa send "<number>@s.whatsapp.net" "<message text>"   # 1:1 / self-send
 ```
 
 ### "Find a chat by partial name"

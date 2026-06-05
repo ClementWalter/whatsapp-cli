@@ -766,16 +766,26 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
 @click.argument("peer")
 @click.argument("text")
 def send(peer: str, text: str) -> None:
-    """Send a text message to a 1:1 chat.
+    """Send a text message to a 1:1 chat or group.
 
-    ``peer`` is a name (resolved against your cached chats, same matcher
-    as ``wa read``) or a full JID like ``33123456789@s.whatsapp.net``.
+    ``peer`` is a name (resolved against your cached chats, same substring
+    matcher as ``wa read``) or a full JID like ``33123456789@s.whatsapp.net``.
     For first-contact sends, pre-key bundle fetch is wired up — no setup
     required as long as you've authenticated.
 
+    A send is irreversible (no unsend). When the exact target matters, pass
+    a full JID, not a name or bare number. Two traps with bare numbers:
+
+    \b
+      * a bare number can match a GROUP — legacy group JIDs embed a phone
+        number (``<number>-<timestamp>@g.us``), so the substring matcher may
+        pick that group over the contact;
+      * to message yourself use ``<number>@s.whatsapp.net`` — the bare number
+        does not reach your own DM, which is keyed by a digit-less ``@lid``.
+
     \b
     Examples:
-      wa send 33123456789@s.whatsapp.net "test from CLI"
+      wa send 33123456789@s.whatsapp.net "test from CLI"   # explicit, safe
       wa send pierre "hi"
     """
     dev = Device.load()
