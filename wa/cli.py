@@ -764,14 +764,26 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
 
 @cli.command()
 @click.argument("peer")
-@click.argument("text")
-def send(peer: str, text: str) -> None:
-    """Send a text message to a 1:1 chat or group.
+@click.argument("text", required=False, default="")
+@click.option(
+    "--doc",
+    "doc_path",
+    type=click.Path(exists=True, dir_okay=False, readable=True),
+    default=None,
+    help="Attach a file (any type) as a document; TEXT becomes its caption.",
+)
+def send(peer: str, text: str, doc_path: str | None) -> None:
+    """Send a text message — or a document — to a 1:1 chat or group.
 
     ``peer`` is a name (resolved against your cached chats, same substring
     matcher as ``wa read``) or a full JID like ``33123456789@s.whatsapp.net``.
     For first-contact sends, pre-key bundle fetch is wired up — no setup
     required as long as you've authenticated.
+
+    With ``--doc PATH`` the file is encrypted, uploaded to WhatsApp's media
+    CDN, and delivered as a document (the mimetype is auto-detected, e.g. a
+    ``.pdf`` arrives as ``application/pdf``). ``TEXT`` is optional and, when
+    present, becomes the document's caption.
 
     A send is irreversible (no unsend). When the exact target matters, pass
     a full JID, not a name or bare number. Two traps with bare numbers:
@@ -787,10 +799,16 @@ def send(peer: str, text: str) -> None:
     Examples:
       wa send 33123456789@s.whatsapp.net "test from CLI"   # explicit, safe
       wa send pierre "hi"
+      wa send pierre --doc report.pdf                       # document, no caption
+      wa send pierre "see attached" --doc report.pdf        # document + caption
     """
     dev = Device.load()
     if dev is None or not dev.is_paired():
         click.echo("not paired — run `login` first", err=True)
+        raise SystemExit(1)
+
+    if not doc_path and not text:
+        click.echo("nothing to send: provide TEXT or --doc PATH", err=True)
         raise SystemExit(1)
 
     from wa.cache import find_chat
@@ -817,9 +835,9 @@ def send(peer: str, text: str) -> None:
 
     with connection_lock():
         if peer_jid.endswith("@g.us"):
-            asyncio.run(_send_group_async(dev, peer_jid, text))
+            asyncio.run(_send_group_async(dev, peer_jid, text, doc_path))
         else:
-            asyncio.run(_send_async(dev, peer_jid, text))
+            asyncio.run(_send_async(dev, peer_jid, text, doc_path))
 
 
 def _phash(devices: list[JID]) -> str:
@@ -1107,7 +1125,137 @@ def _build_dsm_plaintext(text: str, destination_jid: str) -> bytes:
     return _length_delim(31, dsm)
 
 
-async def _send_async(device: Device, peer_jid: str, text: str) -> None:
+async def _fetch_media_conn(fs: FrameSocket, ns) -> tuple[list[str], str]:
+    """Query the media CDN connection — returns (hosts, auth token).
+
+    Mirrors whatsmeow's ``refreshMediaConn``:
+
+    .. code-block:: xml
+
+        <iq to="s.whatsapp.net" type="set" xmlns="w:m"><media_conn/></iq>
+
+    The reply is ``<media_conn auth="..." ttl="..."><host hostname="..."/>
+    ...</media_conn>``. Hosts are returned in preference order.
+    """
+    import secrets
+
+    iq_id = f"mediaconn-{secrets.token_hex(4)}"
+    iq = Node(
+        tag="iq",
+        attrs={
+            "to": JID(server="s.whatsapp.net"),
+            "type": "set",
+            "id": iq_id,
+            "xmlns": "w:m",
+        },
+        content=[Node(tag="media_conn")],
+    )
+    await fs.send(ns.encrypt_frame(encode_node(iq)))
+
+    deadline = asyncio.get_event_loop().time() + 10.0
+    while asyncio.get_event_loop().time() < deadline:
+        try:
+            ct = await fs.recv(
+                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
+            )
+        except (asyncio.TimeoutError, ConnectionError):
+            break
+        try:
+            node = decode_node(ns.decrypt_frame(ct))
+        except Exception:
+            continue
+        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+            continue
+        if node.attrs.get("type") == "error":
+            err = node.get_child_by_tag("error")
+            raise RuntimeError(f"media_conn IQ rejected: {err.attrs if err else node.attrs}")
+        mc = node.get_child_by_tag("media_conn")
+        if mc is None:
+            raise RuntimeError("media_conn reply missing <media_conn>")
+        auth = mc.attrs.get("auth", "")
+        hosts = [
+            h.attrs["hostname"]
+            for h in mc.get_children()
+            if h.tag == "host" and "hostname" in h.attrs
+        ]
+        if not hosts or not auth:
+            raise RuntimeError("media_conn reply missing hosts/auth")
+        return hosts, auth
+    raise TimeoutError("media_conn IQ reply timeout")
+
+
+async def _upload_document(
+    fs: FrameSocket, ns, file_path: str, caption: str | None
+):
+    """Encrypt + upload a file; return ``(DocumentInfo, cache_summary)``.
+
+    Shared by the DM and group send paths — both attach the same
+    ``DocumentMessage`` to their (differently-encrypted) stanzas.
+    """
+    import mimetypes
+    import os
+    import time as _time
+
+    from wa.media import encrypt_media, upload_media
+    from wa.messages import DocumentInfo
+
+    log = logging.getLogger("send")
+
+    with open(file_path, "rb") as f:
+        raw = f.read()
+    if not raw:
+        click.echo(f"refusing to send empty file: {file_path}", err=True)
+        raise SystemExit(1)
+
+    file_name = os.path.basename(file_path)
+    mimetype = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+
+    enc = encrypt_media(raw, "document")
+    hosts, auth = await _fetch_media_conn(fs, ns)
+    url, direct_path = upload_media(enc, hosts, auth, "document")
+
+    doc = DocumentInfo(
+        url=url,
+        direct_path=direct_path,
+        mimetype=mimetype,
+        file_name=file_name,
+        media_key=enc.media_key,
+        file_sha256=enc.file_sha256,
+        file_enc_sha256=enc.file_enc_sha256,
+        file_length=enc.file_length,
+        media_key_timestamp=int(_time.time()),
+        caption=caption,
+        title=file_name,
+    )
+    log.info("uploaded document %s (%d bytes, %s)", file_name, enc.file_length, mimetype)
+    summary = f"[document: {file_name}]" + (f" {caption}" if caption else "")
+    return doc, summary
+
+
+async def _prepare_document(
+    fs: FrameSocket,
+    ns,
+    file_path: str,
+    caption: str | None,
+    dsm_dest: str,
+) -> tuple[bytes, bytes, str]:
+    """DM variant: build both the peer plaintext and the own-device DSM wrap.
+
+    Returns ``(msg_plaintext, dsm_plaintext, summary)``.
+    """
+    from wa.messages import build_document_dsm_plaintext, build_document_plaintext
+
+    doc, summary = await _upload_document(fs, ns, file_path, caption)
+    return (
+        build_document_plaintext(doc),
+        build_document_dsm_plaintext(doc, dsm_dest),
+        summary,
+    )
+
+
+async def _send_async(
+    device: Device, peer_jid: str, text: str, doc_path: str | None = None
+) -> None:
     """Single-shot send: login, usync devices, encrypt per device, transmit, ack.
 
     Implements the same protocol whatsmeow uses for ``sendDM``:
@@ -1190,8 +1338,13 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
         )
         raise SystemExit(1)
 
-    msg_plaintext = _build_message_plaintext(text)
-    dsm_plaintext = _build_dsm_plaintext(text, dsm_dest)
+    # For document sends the plaintext is built after connecting (the upload
+    # needs the authenticated socket); ``cache_text`` is what `wa read` shows.
+    stanza_type = "media" if doc_path else "text"
+    cache_text = text
+    if not doc_path:
+        msg_plaintext = _build_message_plaintext(text)
+        dsm_plaintext = _build_dsm_plaintext(text, dsm_dest)
 
     async with FrameSocket() as fs:
         await fs.connect()
@@ -1237,6 +1390,13 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             if n.tag == "iq" and n.attrs.get("id") == "send-active":
                 break
         await _send_presence_available(fs, ns, device)
+
+        if doc_path:
+            # Encrypt + upload the file now that the socket is authenticated,
+            # then build the document plaintext for the per-device loop below.
+            msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
+                fs, ns, doc_path, text or None, dsm_dest
+            )
 
         # For self-sends we query usync with our LID JID so the response
         # is a list of LID-form devices — matching the LID-addressed
@@ -1405,13 +1565,13 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
             )
         stanza = Node(
             tag="message",
-            attrs={"to": wire_to, "type": "text", "id": msg_id},
+            attrs={"to": wire_to, "type": stanza_type, "id": msg_id},
             content=content_nodes,
         )
         await fs.send(ns.encrypt_frame(encode_node(stanza)))
         log.info(
-            "sent text id=%s to=%s participants=%d any_pkmsg=%s",
-            msg_id, wire_to, len(participant_children), any_pkmsg,
+            "sent %s id=%s to=%s participants=%d any_pkmsg=%s",
+            stanza_type, msg_id, wire_to, len(participant_children), any_pkmsg,
         )
 
         ack_deadline = asyncio.get_event_loop().time() + 15.0
@@ -1440,7 +1600,7 @@ async def _send_async(device: Device, peer_jid: str, text: str) -> None:
                         chat=cache_jid,
                         sender=str(own_pn) if own_pn.user else "",
                         sender_name="me",
-                        text=text,
+                        text=cache_text,
                         from_me=True,
                         msg_id=msg_id,
                     )
@@ -1511,8 +1671,10 @@ async def _fetch_group_members(
     raise TimeoutError("group info IQ timed out")
 
 
-async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
-    """Send a text message to a group via Sender Keys + skmsg.
+async def _send_group_async(
+    device: Device, group_jid: str, text: str, doc_path: str | None = None
+) -> None:
+    """Send a text or document message to a group via Sender Keys + skmsg.
 
     Per-message flow (mirrors whatsmeow's ``sendGroup``):
 
@@ -1681,8 +1843,18 @@ async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
             )
             raise SystemExit(1)
 
-        # 5. Encrypt the actual user message via group cipher.
-        message_plaintext = _build_message_plaintext(text)
+        # 5. Encrypt the actual user message via group cipher. A document
+        # send swaps the conversation plaintext for a DocumentMessage; the
+        # single skmsg covers every participant incl. our own devices, so no
+        # deviceSentMessage wrap is needed here (unlike the DM path).
+        if doc_path:
+            from wa.messages import build_document_plaintext
+
+            doc, cache_text = await _upload_document(fs, ns, doc_path, text or None)
+            message_plaintext = build_document_plaintext(doc)
+        else:
+            cache_text = text
+            message_plaintext = _build_message_plaintext(text)
         skmsg_padded = pad_for_signal(message_plaintext)
         try:
             skmsg_ct = signal.group_encrypt(
@@ -1698,7 +1870,7 @@ async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
         msg_id = "3EB0" + secrets.token_hex(9).upper()
         stanza_attrs: dict = {
             "to": group_jid_obj,
-            "type": "text",
+            "type": "media" if doc_path else "text",
             "id": msg_id,
             "phash": phash,
             "addressing_mode": addressing_mode,
@@ -1736,7 +1908,7 @@ async def _send_group_async(device: Device, group_jid: str, text: str) -> None:
                         chat=group_jid,
                         sender=str(own_pn) if own_pn.user else "",
                         sender_name="me",
-                        text=text,
+                        text=cache_text,
                         from_me=True,
                         msg_id=msg_id,
                     )
@@ -2059,6 +2231,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             4: "contactMessage",
             5: "locationMessage",
             6: "extendedTextMessage",
+            7: "documentMessage",
             12: "protocolMessage",
             23: "audioMessage",
             26: "videoMessage",

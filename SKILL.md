@@ -1,6 +1,6 @@
 ---
 name: whatsapp-cli
-description: "Read and write your own WhatsApp chats from the terminal via the bundled `bin/wa` command. Pairs as a linked device (one-time QR scan); then `bin/wa sync` catches up the offline queue, `bin/wa chats` lists conversations, `bin/wa read <name>` shows a thread, `bin/wa send <peer> \"<text>\"` sends a 1:1 or group message (text only). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
+description: "Read and write your own WhatsApp chats from the terminal via the bundled `bin/wa` command. Pairs as a linked device (one-time QR scan); then `bin/wa sync` catches up the offline queue, `bin/wa chats` lists conversations, `bin/wa read <name>` shows a thread, `bin/wa send <peer> \"<text>\"` sends a 1:1 or group message, and `bin/wa send <peer> --doc <path>` shares a document (PDF or any file). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
 ---
 
 # WhatsApp User CLI
@@ -27,6 +27,7 @@ Trigger this skill when the user wants to:
 - read their own WhatsApp messages (`bin/wa read alice`)
 - catch up after being offline (`bin/wa sync`)
 - send a 1:1 or group message (`bin/wa send "Pierre" "hello"`)
+- share a document / PDF (`bin/wa send "Pierre" --doc report.pdf`)
 - list, search, or count their chats programmatically (`bin/wa chats --json`)
 - check whether the CLI is paired or how recent the last sync was (`bin/wa status`)
 
@@ -102,14 +103,20 @@ Auto-extends from the user's phone if the cache is shorter than `--limit`;
 pass `--no-extend` to disable that network round-trip.
 
 ### `bin/wa send <peer> "<text>"`
-Send a text message. `<peer>` is a fuzzy match (same matcher as `read`) or
-a full JID. Supports 1:1 and group sends.
+Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
+(same matcher as `read`) or a full JID. Supports 1:1 and group sends.
 
 ```bash
 bin/wa send "Pierre" "running late"
 bin/wa send 33123456789@s.whatsapp.net "test"     # self-send (explicit JID)
 bin/wa send "Football" "see you at 7pm"           # group (Sender Keys)
+bin/wa send "Pierre" --doc report.pdf             # share a document (any file)
+bin/wa send "Pierre" "see attached" --doc report.pdf   # document + caption
 ```
+
+`--doc <path>` encrypts the file, uploads it to WhatsApp's media CDN, and
+delivers it as a document message; the mimetype is auto-detected (a `.pdf`
+arrives as `application/pdf`). `TEXT` is optional and becomes the caption.
 
 **⚠️ A send is irreversible — there is no unsend/delete. When the exact
 target matters, always pass a full JID, never a fuzzy name or a bare
