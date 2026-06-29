@@ -106,16 +106,31 @@ pass `--no-extend` to disable that network round-trip.
 Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
 (same matcher as `read`) or a full JID. Supports 1:1 and group sends.
 
-> **🚨 RÈGLE ABSOLUE — TOUJOURS lire avant d'envoyer.** Avant **chaque** envoi
-> (`bin/wa send`), lire d'abord les messages précédents de cette conversation
-> exacte avec `bin/wa read <peer> --limit 30` (ou plus). Aucune exception : 1:1
-> comme groupe, même si on croit connaître le ton. Le but est de **caler le ton,
-> la langue, le registre et les usages** de la conv (tutoiement/vouvoiement,
-> langue réelle des participants, emojis, formules, niveau de formalité,
-> blagues récurrentes) **avant** de rédiger. Un message au mauvais ton est
-> aussi grave qu'un message au mauvais destinataire — et un `send` est
-> irréversible. Si la conv est vide ou introuvable, le signaler et demander le
-> ton souhaité plutôt que de deviner.
+> **🚨 RÈGLE ABSOLUE : TOUJOURS lire avant d'envoyer, et imiter exactement le
+> fil.** Avant **chaque** envoi (`bin/wa send`), lire d'abord les messages
+> précédents de cette conversation exacte avec `bin/wa read <peer> --limit 30`
+> (ou plus). Aucune exception : 1:1 comme groupe, même si on croit connaître le
+> ton.
+>
+> Le message rédigé doit **épouser le fil sur TOUTES ses dimensions** :
+>
+> - **Ton et registre** : niveau de formalité, tutoiement/vouvoiement, humour,
+>   blagues et références récurrentes.
+> - **Langue** : celle réellement parlée par les participants (et le mélange
+>   éventuel).
+> - **Style et syntaxe** : longueur des phrases, façon de tourner, abréviations,
+>   usage des majuscules.
+> - **Ponctuation** : reproduire les usages observés (ex. « .. », « … », « ! »)
+>   et ne jamais en inventer.
+> - **Emojis** : n'utiliser **que** des emojis déjà apparus dans le fil, et au
+>   même dosage. Si le fil n'en contient pas, n'en mettre aucun.
+>
+> **Règle dure anti-innovation : aucun signe de ponctuation ni aucun emoji qui
+> n'a pas déjà été vu dans cette conversation.** On recycle uniquement le
+> vocabulaire de signes du fil, on n'en introduit jamais de nouveau. Un message
+> au mauvais ton (ou au mauvais dosage d'emojis) est aussi grave qu'un message
+> au mauvais destinataire, et un `send` est irréversible. Si le fil est vide ou
+> introuvable, le signaler et demander le ton souhaité plutôt que de deviner.
 
 ```bash
 bin/wa send "Pierre" "running late"
