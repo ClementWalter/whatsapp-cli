@@ -106,6 +106,17 @@ pass `--no-extend` to disable that network round-trip.
 Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
 (same matcher as `read`) or a full JID. Supports 1:1 and group sends.
 
+> **🚨 RÈGLE ABSOLUE — TOUJOURS lire avant d'envoyer.** Avant **chaque** envoi
+> (`bin/wa send`), lire d'abord les messages précédents de cette conversation
+> exacte avec `bin/wa read <peer> --limit 30` (ou plus). Aucune exception : 1:1
+> comme groupe, même si on croit connaître le ton. Le but est de **caler le ton,
+> la langue, le registre et les usages** de la conv (tutoiement/vouvoiement,
+> langue réelle des participants, emojis, formules, niveau de formalité,
+> blagues récurrentes) **avant** de rédiger. Un message au mauvais ton est
+> aussi grave qu'un message au mauvais destinataire — et un `send` est
+> irréversible. Si la conv est vide ou introuvable, le signaler et demander le
+> ton souhaité plutôt que de deviner.
+
 ```bash
 bin/wa send "Pierre" "running late"
 bin/wa send 33123456789@s.whatsapp.net "test"     # self-send (explicit JID)
@@ -181,6 +192,9 @@ bin/wa sync && bin/wa read "<their name>" --limit 100
 
 ### "Send a message to <someone>"
 ```bash
+# STEP 1 — ALWAYS read the thread first to match its tone/language/register:
+bin/wa read "<peer name or JID>" --limit 30
+# STEP 2 — only then compose and send, in the tone observed above:
 bin/wa send "<peer name or JID>" "<message text>"
 # When the exact target matters, pass a full JID (a bare number can match a group):
 bin/wa send "<number>@s.whatsapp.net" "<message text>"   # 1:1 / self-send
