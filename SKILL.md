@@ -124,10 +124,14 @@ Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
 >   et ne jamais en inventer.
 > - **Emojis** : n'utiliser **que** des emojis déjà apparus dans le fil, et au
 >   même dosage. Si le fil n'en contient pas, n'en mettre aucun.
+> - **Onomatopées et interjections** : ne reprendre **que** celles déjà écrites
+>   dans le fil, à l'orthographe exacte (ex. si le fil dit « Ahaha », ne pas
+>   écrire « Haha » ni « héhé »). Aucune variante, aucune invention.
 >
-> **Règle dure anti-innovation : aucun signe de ponctuation ni aucun emoji qui
-> n'a pas déjà été vu dans cette conversation.** On recycle uniquement le
-> vocabulaire de signes du fil, on n'en introduit jamais de nouveau. Un message
+> **Règle dure anti-innovation : aucun signe de ponctuation, aucun emoji, aucune
+> onomatopée ou interjection qui n'a pas déjà été vu, à l'identique, dans cette
+> conversation.** On recycle uniquement le vocabulaire de signes et
+> d'expressions du fil, on n'en introduit jamais de nouveau. Un message
 > au mauvais ton (ou au mauvais dosage d'emojis) est aussi grave qu'un message
 > au mauvais destinataire, et un `send` est irréversible. Si le fil est vide ou
 > introuvable, le signaler et demander le ton souhaité plutôt que de deviner.
