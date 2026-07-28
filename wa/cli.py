@@ -1,8 +1,8 @@
 """WhatsApp user-level CLI.
 
-Subcommands: ``status``, ``login``, ``chats``, ``read``, ``ingest``,
-``import-contacts``. Wired into the ``wa`` console script via the entry
-point declared in ``pyproject.toml``.
+Subcommands: ``status``, ``login``, ``sync``, ``history``, ``chats``,
+``read``, ``ingest``, ``import-contacts``. Wired into the ``wa`` console
+script via the entry point declared in ``pyproject.toml``.
 """
 
 from __future__ import annotations
@@ -551,6 +551,9 @@ def read(
                         click.style(
                             "phone didn't reply — likely chat-history sync is paused on your phone\n"
                             "  (WhatsApp on phone → Settings → Linked Devices → resume Chat History sync)\n"
+                            "  then run `wa history`, which holds a connection open long enough\n"
+                            "  for the phone to push. Note this backfill only ever asks for messages\n"
+                            "  OLDER than the cache, so it cannot fetch recent ones either way.\n"
                             "  showing what's cached.",
                             fg="yellow",
                         ),
@@ -759,6 +762,72 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
             _login_handshake(
                 dev, seconds=seconds, idle=idle, fetch_groups=refresh_groups
             )
+        )
+
+
+@cli.command()
+@click.option(
+    "--minutes",
+    type=float,
+    default=15.0,
+    show_default=True,
+    help="How long to hold the connection open while the phone pushes.",
+)
+def history(minutes: float) -> None:
+    """Hold a connection open so the phone can push chat-history bundles.
+
+    Messages this device never received cannot be pulled by ``read
+    --limit``: that path asks only for messages *older* than what is
+    already cached, so it can never reach recent ones. They arrive only
+    when the phone resumes chat-history sync, and the phone does that
+    solely while WhatsApp is foregrounded on it *and* this device holds a
+    live connection — "la synchro reprendra lorsque WhatsApp sera ouvert
+    sur les deux appareils".
+
+    ``sync`` cannot open that window: its ``--idle`` default hangs up after
+    three seconds of silence, long before the phone starts pushing. This
+    command disables the idle exit and waits, so the two live connections
+    actually overlap.
+    """
+    dev = Device.load()
+    if dev is None or not dev.is_paired():
+        click.echo("not paired — run `login` first", err=True)
+        raise SystemExit(1)
+    from wa.cache import connection_lock, iter_messages
+
+    window = minutes * 60.0
+    click.echo(
+        click.style(
+            f"holding a connection open for {minutes:g} min. On your phone, NOW:\n"
+            "  1. open WhatsApp and leave it in the foreground\n"
+            "  2. stop the screen from locking (it stops serving history when it sleeps)\n"
+            "  3. optionally watch Settings → Linked Devices to see it sync",
+            fg="cyan",
+        ),
+        err=True,
+    )
+    before = sum(1 for _ in iter_messages())
+    # Idle and hard cap are both the full window: a quiet server is the
+    # normal case here (we are waiting on the phone, not on queued mail),
+    # so silence must not be read as "caught up".
+    with connection_lock():
+        asyncio.run(
+            _login_handshake(dev, seconds=window, idle=window, fetch_groups=False)
+        )
+    added = sum(1 for _ in iter_messages()) - before
+    if added > 0:
+        click.echo(click.style(f"stored +{added} messages", fg="green"), err=True)
+    else:
+        click.echo(
+            click.style(
+                "nothing new. Either chat-history sync is still paused on the phone, "
+                "or those messages were never encrypted for this device (a sender "
+                "whose client holds a stale device list for you fans out to your "
+                "phone only) — in which case no sync can recover them; read them "
+                "on the phone.",
+                fg="yellow",
+            ),
+            err=True,
         )
 
 
