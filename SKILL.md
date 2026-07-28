@@ -17,8 +17,21 @@ Examples in this doc are written as `bin/wa <cmd>`; resolve `bin/wa` against
 this skill's own directory. From any other working directory the same script
 can be invoked with its absolute path.
 
-If the user has installed the CLI globally (`uv tool install --from <skill-dir>
-whatsapp-cli`), `wa` on PATH is interchangeable with `bin/wa`.
+If the user has installed the CLI globally, `wa` on PATH is interchangeable
+with `bin/wa` — **provided the install is editable.** A plain
+`uv tool install --from <skill-dir> whatsapp-cli` copies a snapshot, so `wa`
+keeps running the code as it was on install day while `bin/wa` runs the
+current source: a command added here then fails with
+`Error: No such command '<name>'` under `wa` only. Install it editable so the
+two never diverge:
+
+```bash
+cd <skill-dir> && uv tool install --force --editable .
+```
+
+When a `wa` invocation reports an unknown command that `bin/wa --help` lists,
+that stale snapshot is the cause; re-run the line above rather than debugging
+the command.
 
 ## When to use
 
