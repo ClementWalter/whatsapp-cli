@@ -72,6 +72,27 @@ bin/wa sync                  # quick catch-up, ~3-30s depending on backlog
 bin/wa sync --seconds 300    # bigger cap after weeks offline
 ```
 
+`sync` only ingests what the **server** has queued. It reports `0 frames —
+caught up` and exits after `--idle` seconds of silence, which is correct for
+queued mail but useless when you are waiting on the **phone** — use
+`bin/wa history` for that.
+
+### `bin/wa history [--minutes N]`
+Hold a connection open (default 15 min, idle exit disabled) so the phone can
+push chat-history sync bundles. Tell the user to open WhatsApp on their phone
+**in the foreground with the screen kept awake** for the whole window — the
+phone only serves history while both ends are live ("la synchro reprendra
+lorsque WhatsApp sera ouvert sur les deux appareils"), and `sync`'s 3-second
+idle exit closes the socket long before it starts pushing.
+
+```bash
+bin/wa history                 # 15-minute window
+bin/wa history --minutes 30    # longer, for a big backfill
+```
+
+Reach for it when a chat is visibly missing recent messages. See
+**Recovering missing messages** below for when it can't help.
+
 ### `bin/wa chats [--limit N] [--json]`
 List conversations sorted by most recent activity. Default limit 20.
 
@@ -101,6 +122,11 @@ bin/wa read alice --json            # machine-readable
 
 Auto-extends from the user's phone if the cache is shorter than `--limit`;
 pass `--no-extend` to disable that network round-trip.
+
+**The auto-extend only walks backwards.** It asks the phone for messages
+*older* than the oldest it already holds (`requesting N msgs older than
+this`), so raising `--limit` never fetches recent messages — no matter how
+high you push it. For those, see **Recovering missing messages**.
 
 ### `bin/wa send <peer> "<text>"`
 Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
@@ -204,6 +230,14 @@ participants (slower — ~5s cold, ~0s warm).
 bin/wa sync && bin/wa chats --limit 30
 ```
 
+### "A chat is missing its latest messages"
+```bash
+bin/wa history --minutes 15    # user must foreground WhatsApp on the phone now
+bin/wa read "<name>" --no-extend
+```
+See **Recovering missing messages** — if `history` returns nothing new, the
+messages were never encrypted for this device and only the phone has them.
+
 ### "Show me messages from <someone>"
 ```bash
 bin/wa sync && bin/wa read "<their name>" --limit 100
@@ -237,13 +271,55 @@ bin/wa read "alice" --limit 1000 --json --no-extend
 - `--json` mode emits a single JSON document; everything else is rendered
   for human reading.
 
+## Recovering missing messages
+
+A chat that stops days or weeks before the phone shows. Diagnose it in this
+order — the three causes need different fixes, and two of them are
+unfixable, so don't burn rounds re-running `sync`.
+
+**First, confirm the messages really are absent** rather than filed under a
+JID you didn't read. Query the raw store, not the rendered output:
+
+```bash
+cd ~/.cache/whatsapp-cli/store
+# newest message overall — is the store current at all?
+jq -rc '[.ts,.chat]|@tsv' messages.jsonl | sort -rn | head -3
+# newest for the suspect chat
+jq -rc 'select(.chat|test("<jid-fragment>"))|[.ts,(.sender_name//"")]|@tsv' \
+  messages.jsonl | sort -rn | head -3
+```
+
+If the store is current for other chats but stale for this one, delivery is
+the problem, not display.
+
+1. **Chat-history sync paused on the phone** → fixable. `bin/wa history`,
+   with WhatsApp foregrounded on the phone for the whole window.
+2. **The sender's client holds a stale device list** → not fixable
+   retroactively. A 1:1 message only reaches a companion device if the
+   *sender* encrypted a copy for it; if they didn't, no copy exists to
+   fetch and no sync will ever produce one. Suspect this when groups stay
+   current while specific DMs go stale — groups fan out via Sender Keys to
+   every device, DMs don't. Having the user send that contact a message
+   from their phone refreshes the device list for *future* messages only.
+3. **Never delivered and not in the phone's push window** → read it on the
+   phone. Say so plainly instead of looping.
+
+`0 frames — caught up` means the server had nothing queued. It is **not**
+evidence that the local store matches the phone.
+
 ## Things to know
 
 - **Single connection at a time.** A file lock prevents two `bin/wa`
   processes from connecting simultaneously; the second one blocks until
-  the first finishes.
+  the first finishes. This includes `history`, which holds it for its whole
+  window — don't try to `read --limit` in parallel, and stub
+  `wa.cache.connection_lock` in tests so the suite never waits on a live
+  session.
 - **No daemon.** Messages only land locally when you run `bin/wa sync`
-  (or any other connecting command). There's no push.
+  (or any other connecting command). There's no push. Consequence worth
+  internalising: the phone only serves chat history while a companion is
+  *concurrently* connected, so any window this CLI opens is a few seconds
+  wide unless you ask for one explicitly (`bin/wa history`).
 - **`(unnamed)` chats are normal initially.** WhatsApp's app-state
   doesn't ship contact labels to linked devices; run
   `bin/wa import-contacts` (macOS) or let group-info backfill resolve
