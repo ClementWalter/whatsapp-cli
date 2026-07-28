@@ -17,21 +17,20 @@ Examples in this doc are written as `bin/wa <cmd>`; resolve `bin/wa` against
 this skill's own directory. From any other working directory the same script
 can be invoked with its absolute path.
 
-If the user has installed the CLI globally, `wa` on PATH is interchangeable
-with `bin/wa` — **provided the install is editable.** A plain
-`uv tool install --from <skill-dir> whatsapp-cli` copies a snapshot, so `wa`
-keeps running the code as it was on install day while `bin/wa` runs the
-current source: a command added here then fails with
-`Error: No such command '<name>'` under `wa` only. Install it editable so the
-two never diverge:
+`wa` on PATH is a symlink onto `bin/wa`, so it is the same program and cannot
+drift:
 
 ```bash
-cd <skill-dir> && uv tool install --force --editable .
+ln -sfn <skill-dir>/bin/wa ~/.local/bin/wa
 ```
 
-When a `wa` invocation reports an unknown command that `bin/wa --help` lists,
-that stale snapshot is the cause; re-run the line above rather than debugging
-the command.
+**Do not `uv tool install` this package.** That copies a snapshot, so `wa`
+keeps running install-day code while `bin/wa` runs the current source, and a
+newly added command fails with `Error: No such command '<name>'` under `wa`
+only. It is also measurably slower to start than the PEP 723 launcher, since
+`bin/wa` reuses uv's warm dependency cache either way. The `pyproject.toml`
+here exists for the test group (`uv run --group test pytest`), not for
+installing the CLI.
 
 ## When to use
 
