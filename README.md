@@ -23,7 +23,7 @@ Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
 Two ways:
 
 **A — Bundled launcher.** No install step. Clone the repo and invoke
-`bin/wa` directly; the `#!/usr/bin/env -S uv run --script` shebang and
+`wa` directly; the `#!/usr/bin/env -S uv run --script` shebang and
 PEP 723 inline metadata make `uv` pull deps on the first run.
 
 ```bash
@@ -34,7 +34,7 @@ cd whatsapp-cli
 ```
 
 **B — Global tool install.** Puts a `wa` command on PATH; the rest of
-the docs use that shorter form interchangeably with `bin/wa`.
+the docs use that shorter form interchangeably with `wa`.
 
 ```bash
 uv tool install --from ./whatsapp-cli whatsapp-cli
@@ -71,7 +71,7 @@ including `--json`, `--limit`, `--seconds`, `--idle`, `--refresh-groups`,
 
 ## Use as an LLM skill
 
-The repo ships with a `SKILL.md` and a self-contained launcher at `bin/wa`,
+The repo ships with a `SKILL.md` and a self-contained launcher at `wa`,
 both at the project root. The skill is published in the
 [Vercel Labs `skills`](https://github.com/vercel-labs/skills) format — same
 YAML frontmatter + markdown body that the `npx skills` CLI installs, and
@@ -86,7 +86,7 @@ npx skills add ClementWalter/whatsapp-cli
 This drops the skill under `~/.agents/skills/whatsapp-cli/` and
 symlinks it into every supported agent runtime that's installed on your
 machine (Claude Code, Cursor, Windsurf, Codex, Gemini CLI, …). Agents
-then drive the CLI by invoking the bundled `bin/wa` script directly.
+then drive the CLI by invoking the bundled `wa` script directly.
 
 ### Install locally (development / unpublished)
 
@@ -101,8 +101,8 @@ cp -R . ~/.claude/skills/whatsapp-cli
 
 Either way, agents that scan `~/.claude/skills/` (or
 `~/.agents/skills/`) will load `SKILL.md` and resolve commands against
-the sibling `bin/wa` launcher. No separate `uv tool install` needed —
-`bin/wa` is self-contained via PEP 723.
+the sibling `wa` launcher. No separate `uv tool install` needed —
+`wa` is self-contained via PEP 723.
 
 Trigger phrases include "send a WhatsApp message", "read my WhatsApp
 chats", "catch me up on WhatsApp".
