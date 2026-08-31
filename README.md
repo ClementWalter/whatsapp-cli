@@ -4,8 +4,8 @@ A pure-Python WhatsApp client that pairs as a **linked device** and gives you
 your own chats from the terminal:
 
 ```bash
-wa sync                 # catch up
-wa chats                # 1 row per conversation
+wa pull                 # catch up the server mailbox
+wa list                 # 1 row per conversation
 wa read "alice"         # show a thread
 wa send "alice" "hi"    # send a text (1:1 or group)
 wa send "alice" --doc report.pdf   # share a document (PDF or any file)
@@ -53,9 +53,9 @@ on first import — your pairing is preserved.)
 ## Daily usage
 
 ```bash
-wa sync                              # ~3s if nothing new, longer for a backlog
-wa chats                             # 20 most-recent conversations
-wa chats --limit 200 --json          # everything, machine-readable
+wa pull                              # ~3s if nothing new, longer for a backlog
+wa list                              # 20 most-recent conversations
+wa list --limit 200 --json           # everything, machine-readable
 wa read "alice"                      # show alice's thread; auto-fetches more if cache is short
 wa read "alice" --match 2            # disambiguate when multiple "alices" match
 wa read 33123456789@s.whatsapp.net   # exact JID, never ambiguous
@@ -117,7 +117,7 @@ cd tools/oracle && go build -o oracle .
 uv run --group test pytest tests/ -v
 
 # Iterate without reinstalling — PEP 723 launcher pulls deps inline.
-./bin/wa chats
+./bin/wa list
 
 # After editing source, reinstall the console script.
 # (`--reinstall` is required: uv sees the version unchanged and won't rebuild

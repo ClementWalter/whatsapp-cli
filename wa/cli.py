@@ -1,6 +1,7 @@
 """WhatsApp user-level CLI.
 
-Subcommands: ``status``, ``login``, ``sync``, ``history``, ``chats``,
+Subcommands: ``status``, ``login``, ``pull`` (alias ``sync``),
+``backfill`` (alias ``history``), ``list`` (alias ``chats``),
 ``read``, ``ingest``, ``import-contacts``. Wired into the ``wa`` console
 script via the entry point declared in ``pyproject.toml``.
 """
@@ -429,11 +430,15 @@ def migrate_cmd(dry_run: bool) -> None:
     click.echo(click.style("done.\n", fg="green") + summary)
 
 
-@cli.command()
+@cli.command("list")
 @click.option("--limit", type=int, default=20, help="Max chats to show")
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
 def chats(limit: int, json_out: bool) -> None:
-    """List known chats sorted by most recent activity."""
+    """List the local conversation cache (alias: ``chats``).
+
+    Offline. Does not open a socket — run ``wa pull`` first if you want
+    the list to include mail that arrived while we were disconnected.
+    """
     from wa.cache import load_chats, load_contacts
 
     contacts = load_contacts()
@@ -473,6 +478,9 @@ def chats(limit: int, json_out: bool) -> None:
         kind = "group" if jid.endswith("@g.us") else "dm   "
         name = _display_name(jid, info)
         click.echo(f"{ts_s}  {kind}  {name:<30s}  {jid}")
+
+
+cli.add_command(chats, "chats")
 
 
 @cli.command()
@@ -577,7 +585,7 @@ def read(
                         click.style(
                             "phone didn't reply — likely chat-history sync is paused on your phone\n"
                             "  (WhatsApp on phone → Settings → Linked Devices → resume Chat History sync)\n"
-                            "  then run `wa history`, which holds a connection open long enough\n"
+                            "  then run `wa backfill`, which holds a connection open long enough\n"
                             "  for the phone to push. Note this backfill only ever asks for messages\n"
                             "  OLDER than the cache, so it cannot fetch recent ones either way.\n"
                             "  showing what's cached.",
@@ -722,7 +730,7 @@ def status() -> None:
         when = datetime.fromtimestamp(last_ts).strftime("%Y-%m-%d %H:%M")
         click.echo(f"last sync: {when} ({age}, {sync_state.get('last_frames', 0)} frames)")
     else:
-        click.echo("last sync: never — run `wa sync`")
+        click.echo("last sync: never — run `wa pull`")
 
 
 @cli.command()
@@ -742,7 +750,7 @@ def login(reset: bool) -> None:
         asyncio.run(_login_async(dev))
 
 
-@cli.command()
+@cli.command("pull")
 @click.option(
     "--seconds",
     type=float,
@@ -765,17 +773,14 @@ def login(reset: bool) -> None:
     "~150ms per group, capped by WA_GROUPINFO_CAP).",
 )
 def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
-    """Reconnect with existing keys and ingest queued messages.
+    """Pull the server mailbox, then hang up (alias: ``sync``).
 
-    The CLI has no daemon: every minute you're not connected, the server
-    queues new messages and ``chats`` shows stale activity timestamps.
-    ``sync`` opens the WebSocket; the server replays everything queued
-    since the last connection; the listener decrypts each ``<message>``
-    via the stored Signal sessions and writes to ``chats.json`` /
-    ``messages.jsonl``. Exits as soon as the server goes quiet for
-    ``--idle`` seconds (default 3) — so a quick check is ~3s, a long
-    catch-up runs until the queue drains. No QR; device must already be
-    paired.
+    There is no daemon: WhatsApp only delivers while a socket is open.
+    While we are offline the server queues copies encrypted for this
+    device. ``pull`` opens the WebSocket, drains that queue, decrypts
+    each ``<message>``, and exits after ``--idle`` seconds of silence
+    (default 3). That is the *server* mailbox, not a dump of the phone.
+    For phone-side history bundles use ``wa backfill``.
     """
     dev = Device.load()
     if dev is None or not dev.is_paired():
@@ -791,7 +796,10 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
         )
 
 
-@cli.command()
+cli.add_command(sync, "sync")
+
+
+@cli.command("backfill")
 @click.option(
     "--minutes",
     type=float,
@@ -800,20 +808,14 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     help="How long to hold the connection open while the phone pushes.",
 )
 def history(minutes: float) -> None:
-    """Hold a connection open so the phone can push chat-history bundles.
+    """Hold the socket open so the phone can push history (alias: ``history``).
 
-    Messages this device never received cannot be pulled by ``read
-    --limit``: that path asks only for messages *older* than what is
-    already cached, so it can never reach recent ones. They arrive only
-    when the phone resumes chat-history sync, and the phone does that
-    solely while WhatsApp is foregrounded on it *and* this device holds a
-    live connection — "la synchro reprendra lorsque WhatsApp sera ouvert
-    sur les deux appareils".
-
-    ``sync`` cannot open that window: its ``--idle`` default hangs up after
-    three seconds of silence, long before the phone starts pushing. This
-    command disables the idle exit and waits, so the two live connections
-    actually overlap.
+    WhatsApp does not let a companion download the phone's chat database.
+    The phone *pushes* compressed history bundles, and only while both
+    ends are live: WhatsApp foregrounded on the phone *and* this CLI
+    holding a socket. ``pull`` hangs up after 3s of silence, which is
+    too short for that handshake. ``backfill`` keeps the socket up
+    (default 15 min) so the two connections overlap.
     """
     dev = Device.load()
     if dev is None or not dev.is_paired():
@@ -855,6 +857,9 @@ def history(minutes: float) -> None:
             ),
             err=True,
         )
+
+
+cli.add_command(history, "history")
 
 
 @cli.command()
