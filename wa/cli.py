@@ -27,6 +27,7 @@ from wa.pair import (
 )
 from wa.pbutil import decode_fields, summarize
 from wa.prekeys import INITIAL_UPLOAD_COUNT, build_upload_iq, generate_prekey_batch
+from wa.session import InboundSession
 from wa.signal import SignalSession
 from wa.store import DEFAULT_DEVICE_PATH, Device
 from wa.transport.framesocket import FrameSocket
@@ -83,6 +84,31 @@ async def _send_presence_available(fs, ns, device: Device) -> None:
         # Presence is best-effort housekeeping — never fail the user
         # action over it.
         logging.getLogger("login").debug("presence send failed: %s", e)
+
+
+
+def _open_inbound(
+    fs: FrameSocket,
+    ns,
+    device: Device,
+    signal: SignalSession | None = None,
+) -> tuple[InboundSession, SignalSession]:
+    """Take ownership of ``fs.recv`` for the rest of this connection.
+
+    The server starts the offline mailbox as soon as we are authenticated.
+    From that moment a single reader must consume every frame so IQ/ack
+    waiters cannot swallow ``<message>`` stanzas.
+    """
+    if signal is None:
+        signal = SignalSession(device)
+    session = InboundSession(
+        fs,
+        ns,
+        device,
+        on_message=lambda n: _try_decrypt_message(n, signal),
+    )
+    session.start()
+    return session, signal
 
 
 def _setup_logging(debug: bool) -> None:
@@ -935,7 +961,7 @@ def _phash(devices: list[JID]) -> str:
 
 
 async def _fetch_prekey_bundles(
-    fs: FrameSocket, ns, devices: list[JID]
+    session: InboundSession, devices: list[JID]
 ) -> dict[str, dict]:
     """Fetch X3DH prekey bundles for a set of device JIDs.
 
@@ -980,47 +1006,31 @@ async def _fetch_prekey_bundles(
             )
         ],
     )
-    await fs.send(ns.encrypt_frame(encode_node(iq)))
-
-    deadline = asyncio.get_event_loop().time() + 10.0
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            ct = await fs.recv(
-                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
-            )
-        except (asyncio.TimeoutError, ConnectionError):
-            break
-        try:
-            node = decode_node(ns.decrypt_frame(ct))
-        except Exception:
+    node = await session.request_iq(iq, timeout=10.0)
+    if node.attrs.get("type") == "error":
+        err = node.get_child_by_tag("error")
+        raise RuntimeError(
+            f"prekey IQ rejected: {err.attrs if err else node.attrs}"
+        )
+    lst = node.get_child_by_tag("list")
+    if lst is None:
+        return {}
+    out: dict[str, dict] = {}
+    for user_node in lst.get_children():
+        if user_node.tag != "user":
             continue
-        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+        user_jid = user_node.attrs.get("jid")
+        if not isinstance(user_jid, JID):
             continue
-        if node.attrs.get("type") == "error":
-            err = node.get_child_by_tag("error")
-            raise RuntimeError(
-                f"prekey IQ rejected: {err.attrs if err else node.attrs}"
+        try:
+            bundle = _parse_prekey_user_node(user_node)
+        except Exception as e:
+            logging.getLogger("send").warning(
+                "couldn't parse bundle for %s: %s", user_jid, e
             )
-        lst = node.get_child_by_tag("list")
-        if lst is None:
-            return {}
-        out: dict[str, dict] = {}
-        for user_node in lst.get_children():
-            if user_node.tag != "user":
-                continue
-            user_jid = user_node.attrs.get("jid")
-            if not isinstance(user_jid, JID):
-                continue
-            try:
-                bundle = _parse_prekey_user_node(user_node)
-            except Exception as e:
-                logging.getLogger("send").warning(
-                    "couldn't parse bundle for %s: %s", user_jid, e
-                )
-                continue
-            out[user_jid.ad_string()] = bundle
-        return out
-    raise TimeoutError("prekey IQ reply timeout")
+            continue
+        out[user_jid.ad_string()] = bundle
+    return out
 
 
 def _parse_prekey_user_node(user_node: Node) -> dict:
@@ -1083,7 +1093,7 @@ def _parse_prekey_user_node(user_node: Node) -> dict:
 
 
 async def _usync_devices(
-    fs: FrameSocket, ns, queried: list[JID]
+    session: InboundSession, queried: list[JID]
 ) -> list[JID]:
     """Query the server for every JID's device list.
 
@@ -1126,52 +1136,39 @@ async def _usync_devices(
             )
         ],
     )
-    await fs.send(ns.encrypt_frame(encode_node(iq)))
-    deadline = asyncio.get_event_loop().time() + 8.0
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            ct = await fs.recv(timeout=max(0.1, deadline - asyncio.get_event_loop().time()))
-        except (asyncio.TimeoutError, ConnectionError):
-            break
-        try:
-            node = decode_node(ns.decrypt_frame(ct))
-        except Exception:
+    node = await session.request_iq(iq, timeout=8.0)
+    if node.attrs.get("type") == "error":
+        err = node.get_child_by_tag("error")
+        raise RuntimeError(f"usync rejected: {err.attrs if err else node.attrs}")
+    lst = node.get_child_by_tag("usync", "list")
+    if lst is None:
+        return []
+    out: list[JID] = []
+    for user_node in lst.get_children():
+        if user_node.tag != "user":
             continue
-        if node.tag != "iq" or node.attrs.get("id") != iq_id:
+        user_jid = user_node.attrs.get("jid")
+        if not isinstance(user_jid, JID):
             continue
-        if node.attrs.get("type") == "error":
-            err = node.get_child_by_tag("error")
-            raise RuntimeError(f"usync rejected: {err.attrs if err else node.attrs}")
-        lst = node.get_child_by_tag("usync", "list")
-        if lst is None:
-            return []
-        out: list[JID] = []
-        for user_node in lst.get_children():
-            if user_node.tag != "user":
+        dl = user_node.get_child_by_tag("devices", "device-list")
+        if dl is None:
+            continue
+        for dev_node in dl.get_children():
+            if dev_node.tag != "device":
                 continue
-            user_jid = user_node.attrs.get("jid")
-            if not isinstance(user_jid, JID):
+            try:
+                dev_id = int(dev_node.attrs.get("id", 0))
+            except (TypeError, ValueError):
                 continue
-            dl = user_node.get_child_by_tag("devices", "device-list")
-            if dl is None:
-                continue
-            for dev_node in dl.get_children():
-                if dev_node.tag != "device":
-                    continue
-                try:
-                    dev_id = int(dev_node.attrs.get("id", 0))
-                except (TypeError, ValueError):
-                    continue
-                out.append(
-                    JID(
-                        user=user_jid.user,
-                        server=user_jid.server,
-                        agent=user_jid.agent,
-                        device=dev_id,
-                    )
+            out.append(
+                JID(
+                    user=user_jid.user,
+                    server=user_jid.server,
+                    agent=user_jid.agent,
+                    device=dev_id,
                 )
-        return out
-    raise TimeoutError("usync device query timed out")
+            )
+    return out
 
 
 def _build_message_plaintext(text: str) -> bytes:
@@ -1201,7 +1198,7 @@ def _build_dsm_plaintext(text: str, destination_jid: str) -> bytes:
     return _length_delim(31, dsm)
 
 
-async def _fetch_media_conn(fs: FrameSocket, ns) -> tuple[list[str], str]:
+async def _fetch_media_conn(session: InboundSession) -> tuple[list[str], str]:
     """Query the media CDN connection — returns (hosts, auth token).
 
     Mirrors whatsmeow's ``refreshMediaConn``:
@@ -1226,42 +1223,26 @@ async def _fetch_media_conn(fs: FrameSocket, ns) -> tuple[list[str], str]:
         },
         content=[Node(tag="media_conn")],
     )
-    await fs.send(ns.encrypt_frame(encode_node(iq)))
-
-    deadline = asyncio.get_event_loop().time() + 10.0
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            ct = await fs.recv(
-                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
-            )
-        except (asyncio.TimeoutError, ConnectionError):
-            break
-        try:
-            node = decode_node(ns.decrypt_frame(ct))
-        except Exception:
-            continue
-        if node.tag != "iq" or node.attrs.get("id") != iq_id:
-            continue
-        if node.attrs.get("type") == "error":
-            err = node.get_child_by_tag("error")
-            raise RuntimeError(f"media_conn IQ rejected: {err.attrs if err else node.attrs}")
-        mc = node.get_child_by_tag("media_conn")
-        if mc is None:
-            raise RuntimeError("media_conn reply missing <media_conn>")
-        auth = mc.attrs.get("auth", "")
-        hosts = [
-            h.attrs["hostname"]
-            for h in mc.get_children()
-            if h.tag == "host" and "hostname" in h.attrs
-        ]
-        if not hosts or not auth:
-            raise RuntimeError("media_conn reply missing hosts/auth")
-        return hosts, auth
-    raise TimeoutError("media_conn IQ reply timeout")
+    node = await session.request_iq(iq, timeout=10.0)
+    if node.attrs.get("type") == "error":
+        err = node.get_child_by_tag("error")
+        raise RuntimeError(f"media_conn IQ rejected: {err.attrs if err else node.attrs}")
+    mc = node.get_child_by_tag("media_conn")
+    if mc is None:
+        raise RuntimeError("media_conn reply missing <media_conn>")
+    auth = mc.attrs.get("auth", "")
+    hosts = [
+        h.attrs["hostname"]
+        for h in mc.get_children()
+        if h.tag == "host" and "hostname" in h.attrs
+    ]
+    if not hosts or not auth:
+        raise RuntimeError("media_conn reply missing hosts/auth")
+    return hosts, auth
 
 
 async def _upload_document(
-    fs: FrameSocket, ns, file_path: str, caption: str | None, make_thumb: bool = True
+    session: InboundSession, file_path: str, caption: str | None, make_thumb: bool = True
 ):
     """Encrypt + upload a file; return ``(DocumentInfo, cache_summary)``.
 
@@ -1298,7 +1279,7 @@ async def _upload_document(
             log.info("embedded %dx%d thumbnail (%d bytes)", thumb_w, thumb_h, len(jpg))
 
     enc = encrypt_media(raw, "document")
-    hosts, auth = await _fetch_media_conn(fs, ns)
+    hosts, auth = await _fetch_media_conn(session)
     url, direct_path = upload_media(enc, hosts, auth, "document")
 
     doc = DocumentInfo(
@@ -1323,8 +1304,7 @@ async def _upload_document(
 
 
 async def _prepare_document(
-    fs: FrameSocket,
-    ns,
+    session: InboundSession,
     file_path: str,
     caption: str | None,
     dsm_dest: str,
@@ -1336,7 +1316,7 @@ async def _prepare_document(
     """
     from wa.messages import build_document_dsm_plaintext, build_document_plaintext
 
-    doc, summary = await _upload_document(fs, ns, file_path, caption, make_thumb)
+    doc, summary = await _upload_document(session, file_path, caption, make_thumb)
     return (
         build_document_plaintext(doc),
         build_document_dsm_plaintext(doc, dsm_dest),
@@ -1464,102 +1444,133 @@ async def _send_async(
                 )
                 raise SystemExit(1)
 
-        active = Node(
-            tag="iq",
-            attrs={
-                "to": JID(server="s.whatsapp.net"),
-                "type": "set",
-                "id": "send-active",
-                "xmlns": "passive",
-            },
-            content=[Node(tag="active")],
-        )
-        await fs.send(ns.encrypt_frame(encode_node(active)))
-        active_deadline = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < active_deadline:
-            try:
-                ct = await fs.recv(timeout=0.5)
-            except (asyncio.TimeoutError, ConnectionError):
-                break
-            n = decode_node(ns.decrypt_frame(ct))
-            if n.tag == "iq" and n.attrs.get("id") == "send-active":
-                break
-        await _send_presence_available(fs, ns, device)
-
-        if doc_path:
-            # Encrypt + upload the file now that the socket is authenticated,
-            # then build the document plaintext for the per-device loop below.
-            msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
-                fs, ns, doc_path, text or None, dsm_dest, make_thumb
-            )
-
-        # For self-sends we query usync with our LID JID so the response
-        # is a list of LID-form devices — matching the LID-addressed
-        # stanza we'll build below. For peer sends, query PN.
-        if is_self_send and own_lid is not None:
-            queried = [JID(user=own_lid.user, server="lid")]
-        else:
-            queried = [peer_pn_jid]
-            if peer_pn_jid.user != own_pn.user:
-                queried.append(JID(user=own_pn.user, server="s.whatsapp.net"))
+        session, signal = _open_inbound(fs, ns, device)
         try:
-            all_devices = await _usync_devices(fs, ns, queried)
-        except Exception as e:
-            click.echo(click.style(f"device list query failed: {e}", fg="red"), err=True)
-            raise SystemExit(1)
-        if not all_devices:
-            click.echo(
-                click.style(
-                    "no devices returned — peer may have no WhatsApp account",
-                    fg="red",
-                ),
-                err=True,
-            )
-            raise SystemExit(1)
-        log.info("device list (PN form): %s", [str(d) for d in all_devices])
-
-        signal = SignalSession(device)
-        # Probe each device for an existing session; for any device that
-        # has none, fetch a prekey bundle so the first encrypt becomes a
-        # pkmsg via X3DH instead of failing with "session not found".
-        no_session_devices: list[JID] = []
-        for dev in all_devices:
-            is_own = (
-                (is_self_send and own_lid is not None and dev.user == own_lid.user)
-                or (not is_self_send and dev.user == own_pn.user)
-            )
-            if is_own and dev.device == own_self_device:
-                continue
-            if is_self_send:
-                enc_user = dev.user
-            elif is_own and own_lid is not None:
-                enc_user = own_lid.user
-            elif (not is_own) and peer_lid_user is not None:
-                enc_user = peer_lid_user
-            else:
-                enc_user = dev.user
-            if not signal.has_session(enc_user, dev.device):
-                no_session_devices.append(dev)
-        if no_session_devices:
-            log.info(
-                "fetching prekey bundles for %d device(s) with no session",
-                len(no_session_devices),
+            active = Node(
+                tag="iq",
+                attrs={
+                    "to": JID(server="s.whatsapp.net"),
+                    "type": "set",
+                    "id": "send-active",
+                    "xmlns": "passive",
+                },
+                content=[Node(tag="active")],
             )
             try:
-                bundles = await _fetch_prekey_bundles(fs, ns, no_session_devices)
+                await session.request_iq(active, timeout=5.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                log.debug("active IQ unconfirmed")
+            await _send_presence_available(fs, ns, device)
+
+            if doc_path:
+                # Encrypt + upload the file now that the socket is authenticated,
+                # then build the document plaintext for the per-device loop below.
+                msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
+                    session, doc_path, text or None, dsm_dest, make_thumb
+                )
+
+            # For self-sends we query usync with our LID JID so the response
+            # is a list of LID-form devices — matching the LID-addressed
+            # stanza we'll build below. For peer sends, query PN.
+            if is_self_send and own_lid is not None:
+                queried = [JID(user=own_lid.user, server="lid")]
+            else:
+                queried = [peer_pn_jid]
+                if peer_pn_jid.user != own_pn.user:
+                    queried.append(JID(user=own_pn.user, server="s.whatsapp.net"))
+            try:
+                all_devices = await _usync_devices(session, queried)
             except Exception as e:
-                log.warning("prekey fetch failed: %s — some devices will be skipped", e)
-                bundles = {}
-            for dev in no_session_devices:
-                bundle = bundles.get(dev.ad_string())
-                if bundle is None:
-                    log.debug("no bundle returned for %s", dev)
-                    continue
-                # Use the same encryption-identity rules as below.
+                click.echo(click.style(f"device list query failed: {e}", fg="red"), err=True)
+                raise SystemExit(1)
+            if not all_devices:
+                click.echo(
+                    click.style(
+                        "no devices returned — peer may have no WhatsApp account",
+                        fg="red",
+                    ),
+                    err=True,
+                )
+                raise SystemExit(1)
+            log.info("device list (PN form): %s", [str(d) for d in all_devices])
+
+            # Probe each device for an existing session; for any device that
+            # has none, fetch a prekey bundle so the first encrypt becomes a
+            # pkmsg via X3DH instead of failing with "session not found".
+            no_session_devices: list[JID] = []
+            for dev in all_devices:
                 is_own = (
                     (is_self_send and own_lid is not None and dev.user == own_lid.user)
                     or (not is_self_send and dev.user == own_pn.user)
                 )
+                if is_own and dev.device == own_self_device:
+                    continue
+                if is_self_send:
+                    enc_user = dev.user
+                elif is_own and own_lid is not None:
+                    enc_user = own_lid.user
+                elif (not is_own) and peer_lid_user is not None:
+                    enc_user = peer_lid_user
+                else:
+                    enc_user = dev.user
+                if not signal.has_session(enc_user, dev.device):
+                    no_session_devices.append(dev)
+            if no_session_devices:
+                log.info(
+                    "fetching prekey bundles for %d device(s) with no session",
+                    len(no_session_devices),
+                )
+                try:
+                    bundles = await _fetch_prekey_bundles(session, no_session_devices)
+                except Exception as e:
+                    log.warning("prekey fetch failed: %s — some devices will be skipped", e)
+                    bundles = {}
+                for dev in no_session_devices:
+                    bundle = bundles.get(dev.ad_string())
+                    if bundle is None:
+                        log.debug("no bundle returned for %s", dev)
+                        continue
+                    # Use the same encryption-identity rules as below.
+                    is_own = (
+                        (is_self_send and own_lid is not None and dev.user == own_lid.user)
+                        or (not is_self_send and dev.user == own_pn.user)
+                    )
+                    if is_self_send:
+                        enc_user = dev.user
+                    elif is_own and own_lid is not None:
+                        enc_user = own_lid.user
+                    elif (not is_own) and peer_lid_user is not None:
+                        enc_user = peer_lid_user
+                    else:
+                        enc_user = dev.user
+                    try:
+                        signal.install_prekey_bundle(enc_user, dev.device, **bundle)
+                        log.debug("installed bundle for %s:%d", enc_user, dev.device)
+                    except Exception as e:
+                        log.warning(
+                            "couldn't install bundle for %s:%d: %s",
+                            enc_user, dev.device, e,
+                        )
+
+            participant_children: list[Node] = []
+            missing_sessions: list[str] = []
+            any_pkmsg = False
+            for dev in all_devices:
+                # "Own device" check: depends on which namespace we queried.
+                # For self-sends we queried LID, so all devices have user ==
+                # own_lid.user. For peer sends we queried PN.
+                if is_self_send:
+                    is_own = own_lid is not None and dev.user == own_lid.user
+                else:
+                    is_own = dev.user == own_pn.user
+                if is_own and dev.device == own_self_device:
+                    continue
+                plaintext = dsm_plaintext if is_own else msg_plaintext
+                padded = pad_for_signal(plaintext)
+                # Encryption identity. For self-sends the device list IS
+                # already LID, so encrypt under dev.user directly. For peer
+                # sends, dev.user is PN; translate to the peer's LID local
+                # part (which is where active sessions are stored).
                 if is_self_send:
                     enc_user = dev.user
                 elif is_own and own_lid is not None:
@@ -1569,156 +1580,110 @@ async def _send_async(
                 else:
                     enc_user = dev.user
                 try:
-                    signal.install_prekey_bundle(enc_user, dev.device, **bundle)
-                    log.debug("installed bundle for %s:%d", enc_user, dev.device)
+                    ct, kind = signal.encrypt_msg(enc_user, dev.device, padded)
                 except Exception as e:
-                    log.warning(
-                        "couldn't install bundle for %s:%d: %s",
-                        enc_user, dev.device, e,
+                    missing_sessions.append(f"{enc_user}:{dev.device}")
+                    log.debug("no session with %s:%d (%s)", enc_user, dev.device, e)
+                    continue
+                if kind == "pkmsg":
+                    any_pkmsg = True
+                # Wire identity matches what we'll address the stanza with:
+                # LID for self-sends, PN for peer sends. Media messages carry a
+                # `mediatype` on every <enc> so the recipient treats the
+                # decrypted payload as media (whatsmeow sets this whenever the
+                # message has a media type — without it documents don't render).
+                enc_attrs = {"v": "2", "type": kind}
+                if doc_path:
+                    enc_attrs["mediatype"] = "document"
+                participant_children.append(
+                    Node(
+                        tag="to",
+                        attrs={"jid": dev},
+                        content=[Node(tag="enc", attrs=enc_attrs, content=ct)],
                     )
-
-        participant_children: list[Node] = []
-        missing_sessions: list[str] = []
-        any_pkmsg = False
-        for dev in all_devices:
-            # "Own device" check: depends on which namespace we queried.
-            # For self-sends we queried LID, so all devices have user ==
-            # own_lid.user. For peer sends we queried PN.
-            if is_self_send:
-                is_own = own_lid is not None and dev.user == own_lid.user
-            else:
-                is_own = dev.user == own_pn.user
-            if is_own and dev.device == own_self_device:
-                continue
-            plaintext = dsm_plaintext if is_own else msg_plaintext
-            padded = pad_for_signal(plaintext)
-            # Encryption identity. For self-sends the device list IS
-            # already LID, so encrypt under dev.user directly. For peer
-            # sends, dev.user is PN; translate to the peer's LID local
-            # part (which is where active sessions are stored).
-            if is_self_send:
-                enc_user = dev.user
-            elif is_own and own_lid is not None:
-                enc_user = own_lid.user
-            elif (not is_own) and peer_lid_user is not None:
-                enc_user = peer_lid_user
-            else:
-                enc_user = dev.user
-            try:
-                ct, kind = signal.encrypt_msg(enc_user, dev.device, padded)
-            except Exception as e:
-                missing_sessions.append(f"{enc_user}:{dev.device}")
-                log.debug("no session with %s:%d (%s)", enc_user, dev.device, e)
-                continue
-            if kind == "pkmsg":
-                any_pkmsg = True
-            # Wire identity matches what we'll address the stanza with:
-            # LID for self-sends, PN for peer sends. Media messages carry a
-            # `mediatype` on every <enc> so the recipient treats the
-            # decrypted payload as media (whatsmeow sets this whenever the
-            # message has a media type — without it documents don't render).
-            enc_attrs = {"v": "2", "type": kind}
-            if doc_path:
-                enc_attrs["mediatype"] = "document"
-            participant_children.append(
-                Node(
-                    tag="to",
-                    attrs={"jid": dev},
-                    content=[Node(tag="enc", attrs=enc_attrs, content=ct)],
                 )
-            )
-        if not participant_children:
-            click.echo(
-                click.style(
-                    "no encryptable devices — every target lacked a Signal session.\n"
-                    "  hint: receive any message from the peer first (so their session "
-                    "is bootstrapped), then retry. Pre-key bundle fetch for "
-                    "first-contact sends is not yet implemented.",
-                    fg="red",
-                ),
-                err=True,
-            )
-            raise SystemExit(1)
-        if missing_sessions:
-            log.warning(
-                "skipped %d device(s) with no session: %s",
-                len(missing_sessions), ", ".join(missing_sessions),
-            )
-
-        # The participant-list hash (`phash`) is computed for diagnostics
-        # but deliberately NOT placed on the DM stanza — whatsmeow only
-        # puts it on group sends, and including it on DMs makes the
-        # server quietly drop the message. Same for `addressing_mode`,
-        # which is a group-specific attribute.
-        msg_id = "3EB0" + secrets.token_hex(9).upper()
-        content_nodes: list[Node] = [
-            Node(tag="participants", content=participant_children)
-        ]
-        if any_pkmsg and device.account:
-            # When any per-device `<enc>` was a pkmsg (first message in
-            # that session direction), the recipient needs our signed
-            # ADV identity to verify the prekey signal message. The blob
-            # is `ADVSignedDeviceIdentity`, captured during pairing.
-            content_nodes.append(
-                Node(tag="device-identity", content=device.account)
-            )
-        stanza = Node(
-            tag="message",
-            attrs={"to": wire_to, "type": stanza_type, "id": msg_id},
-            content=content_nodes,
-        )
-        await fs.send(ns.encrypt_frame(encode_node(stanza)))
-        log.info(
-            "sent %s id=%s to=%s participants=%d any_pkmsg=%s",
-            stanza_type, msg_id, wire_to, len(participant_children), any_pkmsg,
-        )
-
-        ack_deadline = asyncio.get_event_loop().time() + 15.0
-        while asyncio.get_event_loop().time() < ack_deadline:
-            try:
-                ct = await fs.recv(
-                    timeout=max(0.1, ack_deadline - asyncio.get_event_loop().time())
+            if not participant_children:
+                click.echo(
+                    click.style(
+                        "no encryptable devices — every target lacked a Signal session.\n"
+                        "  hint: receive any message from the peer first (so their session "
+                        "is bootstrapped), then retry. Pre-key bundle fetch for "
+                        "first-contact sends is not yet implemented.",
+                        fg="red",
+                    ),
+                    err=True,
                 )
+                raise SystemExit(1)
+            if missing_sessions:
+                log.warning(
+                    "skipped %d device(s) with no session: %s",
+                    len(missing_sessions), ", ".join(missing_sessions),
+                )
+
+            # The participant-list hash (`phash`) is computed for diagnostics
+            # but deliberately NOT placed on the DM stanza — whatsmeow only
+            # puts it on group sends, and including it on DMs makes the
+            # server quietly drop the message. Same for `addressing_mode`,
+            # which is a group-specific attribute.
+            msg_id = "3EB0" + secrets.token_hex(9).upper()
+            content_nodes: list[Node] = [
+                Node(tag="participants", content=participant_children)
+            ]
+            if any_pkmsg and device.account:
+                # When any per-device `<enc>` was a pkmsg (first message in
+                # that session direction), the recipient needs our signed
+                # ADV identity to verify the prekey signal message. The blob
+                # is `ADVSignedDeviceIdentity`, captured during pairing.
+                content_nodes.append(
+                    Node(tag="device-identity", content=device.account)
+                )
+            stanza = Node(
+                tag="message",
+                attrs={"to": wire_to, "type": stanza_type, "id": msg_id},
+                content=content_nodes,
+            )
+            await session.send_node(stanza)
+            log.info(
+                "sent %s id=%s to=%s participants=%d any_pkmsg=%s",
+                stanza_type, msg_id, wire_to, len(participant_children), any_pkmsg,
+            )
+
+            try:
+                await session.wait_ack(msg_id, timeout=15.0)
             except (asyncio.TimeoutError, ConnectionError):
-                break
-            try:
-                node = decode_node(ns.decrypt_frame(ct))
-            except Exception:
-                continue
-            if node.tag == "ack" and node.attrs.get("id") == msg_id:
-                # Canonicalize before persisting: a user-typed peer JID
-                # may be in PN form even when canonical form is @lid.
-                # Without this we'd write a duplicate row in chats.json.
-                from wa.cache import canonical_jid
-
-                cache_jid = canonical_jid(peer_jid)
-                ts = int(_time.time())
-                append_messages([
-                    CachedMessage(
-                        ts=ts,
-                        chat=cache_jid,
-                        sender=str(own_pn) if own_pn.user else "",
-                        sender_name="me",
-                        text=cache_text,
-                        from_me=True,
-                        msg_id=msg_id,
-                    )
-                ])
-                upsert_chat(cache_jid, last_ts=ts)
-                click.echo(click.style(f"sent: {msg_id}", fg="green"))
+                click.echo(
+                    click.style(
+                        "no ack within 15s — message may or may not have been queued",
+                        fg="yellow",
+                    ),
+                    err=True,
+                )
                 return
-            log.debug("ignoring frame while waiting for ack: %s", node.tag)
-        click.echo(
-            click.style(
-                "no ack within 15s — message may or may not have been queued",
-                fg="yellow",
-            ),
-            err=True,
-        )
+            # Canonicalize before persisting: a user-typed peer JID
+            # may be in PN form even when canonical form is @lid.
+            from wa.cache import canonical_jid
+
+            cache_jid = canonical_jid(peer_jid)
+            ts = int(_time.time())
+            append_messages([
+                CachedMessage(
+                    ts=ts,
+                    chat=cache_jid,
+                    sender=str(own_pn) if own_pn.user else "",
+                    sender_name="me",
+                    text=cache_text,
+                    from_me=True,
+                    msg_id=msg_id,
+                )
+            ])
+            upsert_chat(cache_jid, last_ts=ts)
+            click.echo(click.style(f"sent: {msg_id}", fg="green"))
+        finally:
+            await session.stop()
 
 
 async def _fetch_group_members(
-    fs: FrameSocket, ns, group_jid: JID
+    session: InboundSession, group_jid: JID
 ) -> tuple[list[JID], str]:
     """Get the current participant list for ``group_jid``.
 
@@ -1737,37 +1702,22 @@ async def _fetch_group_members(
         attrs={"to": group_jid, "type": "get", "id": iq_id, "xmlns": "w:g2"},
         content=[Node(tag="query", attrs={"request": "interactive"})],
     )
-    await fs.send(ns.encrypt_frame(encode_node(iq)))
-    deadline = asyncio.get_event_loop().time() + 8.0
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            ct = await fs.recv(
-                timeout=max(0.1, deadline - asyncio.get_event_loop().time())
-            )
-        except (asyncio.TimeoutError, ConnectionError):
-            break
-        try:
-            node = decode_node(ns.decrypt_frame(ct))
-        except Exception:
+    node = await session.request_iq(iq, timeout=8.0)
+    if node.attrs.get("type") == "error":
+        err = node.get_child_by_tag("error")
+        raise RuntimeError(f"group info IQ rejected: {err.attrs if err else node.attrs}")
+    grp = node.get_child_by_tag("group")
+    if grp is None:
+        raise RuntimeError("group info reply has no <group>")
+    addressing_mode = grp.attrs.get("addressing_mode", "pn") or "pn"
+    participants: list[JID] = []
+    for child in grp.get_children():
+        if child.tag != "participant":
             continue
-        if node.tag != "iq" or node.attrs.get("id") != iq_id:
-            continue
-        if node.attrs.get("type") == "error":
-            err = node.get_child_by_tag("error")
-            raise RuntimeError(f"group info IQ rejected: {err.attrs if err else node.attrs}")
-        grp = node.get_child_by_tag("group")
-        if grp is None:
-            raise RuntimeError("group info reply has no <group>")
-        addressing_mode = grp.attrs.get("addressing_mode", "pn") or "pn"
-        participants: list[JID] = []
-        for child in grp.get_children():
-            if child.tag != "participant":
-                continue
-            pjid = child.attrs.get("jid")
-            if isinstance(pjid, JID):
-                participants.append(pjid)
-        return participants, addressing_mode
-    raise TimeoutError("group info IQ timed out")
+        pjid = child.attrs.get("jid")
+        if isinstance(pjid, JID):
+            participants.append(pjid)
+    return participants, addressing_mode
 
 
 async def _send_group_async(
@@ -1829,205 +1779,192 @@ async def _send_group_async(
                 )
                 raise SystemExit(1)
 
-        active = Node(
-            tag="iq",
-            attrs={
-                "to": JID(server="s.whatsapp.net"),
-                "type": "set",
-                "id": "send-active",
-                "xmlns": "passive",
-            },
-            content=[Node(tag="active")],
-        )
-        await fs.send(ns.encrypt_frame(encode_node(active)))
-        active_dl = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < active_dl:
+        session, signal = _open_inbound(fs, ns, device)
+        try:
+            active = Node(
+                tag="iq",
+                attrs={
+                    "to": JID(server="s.whatsapp.net"),
+                    "type": "set",
+                    "id": "send-active",
+                    "xmlns": "passive",
+                },
+                content=[Node(tag="active")],
+            )
             try:
-                ct = await fs.recv(timeout=0.5)
+                await session.request_iq(active, timeout=5.0)
             except (asyncio.TimeoutError, ConnectionError):
-                break
-            n = decode_node(ns.decrypt_frame(ct))
-            if n.tag == "iq" and n.attrs.get("id") == "send-active":
-                break
-        await _send_presence_available(fs, ns, device)
+                log.debug("active IQ unconfirmed")
+            await _send_presence_available(fs, ns, device)
 
-        # 1. Group participants + addressing mode.
-        try:
-            participants, addressing_mode = await _fetch_group_members(
-                fs, ns, group_jid_obj
-            )
-        except Exception as e:
-            click.echo(click.style(f"group info failed: {e}", fg="red"), err=True)
-            raise SystemExit(1)
-        if not participants:
-            click.echo(
-                click.style("group has no participants — are you still in it?", fg="red"),
-                err=True,
-            )
-            raise SystemExit(1)
-        log.info(
-            "group %s: %d participants, addressing_mode=%s",
-            group_jid, len(participants), addressing_mode,
-        )
-
-        # 2. Expand to AD JIDs via usync. Whatsmeow uses the participant
-        # list as-is (LIDs for LID-addressed groups).
-        try:
-            all_devices = await _usync_devices(fs, ns, participants)
-        except Exception as e:
-            click.echo(
-                click.style(f"device list query failed: {e}", fg="red"), err=True
-            )
-            raise SystemExit(1)
-        # Drop our own current device from the recipient set.
-        sender_user = own_lid.user if (addressing_mode == "lid" and own_lid) else own_pn.user
-        targets = [
-            d for d in all_devices
-            if not (d.user == sender_user and d.device == own_self_device)
-        ]
-        log.info("targets: %d device(s) across %d participants", len(targets), len(participants))
-
-        # 3. Generate the SKDM for this group + our LID-keyed sender addr.
-        signal = SignalSession(device)
-        skdm_bytes = signal.create_sender_key_distribution(
-            group_id=str(group_jid_obj), sender_user=sender_user, sender_device=own_self_device
-        )
-
-        # 4. Wrap in Message{senderKeyDistributionMessage{groupID, axolotl_bytes}}
-        skdm_inner = _string_field(1, str(group_jid_obj)) + _length_delim(2, skdm_bytes)
-        skdm_message_proto = _length_delim(2, skdm_inner)
-        skdm_padded = pad_for_signal(skdm_message_proto)
-
-        # Fetch bundles for sessionless devices in one batch.
-        no_session_devices = [
-            d for d in targets if not signal.has_session(d.user, d.device)
-        ]
-        if no_session_devices:
-            log.info("fetching prekey bundles for %d device(s)", len(no_session_devices))
+            # 1. Group participants + addressing mode.
             try:
-                bundles = await _fetch_prekey_bundles(fs, ns, no_session_devices)
+                participants, addressing_mode = await _fetch_group_members(
+                    session, group_jid_obj
+                )
             except Exception as e:
-                log.warning("prekey fetch failed: %s", e)
-                bundles = {}
-            for d in no_session_devices:
-                b = bundles.get(d.ad_string())
-                if not b:
-                    continue
+                click.echo(click.style(f"group info failed: {e}", fg="red"), err=True)
+                raise SystemExit(1)
+            if not participants:
+                click.echo(
+                    click.style("group has no participants — are you still in it?", fg="red"),
+                    err=True,
+                )
+                raise SystemExit(1)
+            log.info(
+                "group %s: %d participants, addressing_mode=%s",
+                group_jid, len(participants), addressing_mode,
+            )
+
+            # 2. Expand to AD JIDs via usync. Whatsmeow uses the participant
+            # list as-is (LIDs for LID-addressed groups).
+            try:
+                all_devices = await _usync_devices(session, participants)
+            except Exception as e:
+                click.echo(
+                    click.style(f"device list query failed: {e}", fg="red"), err=True
+                )
+                raise SystemExit(1)
+            # Drop our own current device from the recipient set.
+            sender_user = own_lid.user if (addressing_mode == "lid" and own_lid) else own_pn.user
+            targets = [
+                d for d in all_devices
+                if not (d.user == sender_user and d.device == own_self_device)
+            ]
+            log.info("targets: %d device(s) across %d participants", len(targets), len(participants))
+
+            # 3. Generate the SKDM for this group + our LID-keyed sender addr.
+            skdm_bytes = signal.create_sender_key_distribution(
+                group_id=str(group_jid_obj), sender_user=sender_user, sender_device=own_self_device
+            )
+
+            # 4. Wrap in Message{senderKeyDistributionMessage{groupID, axolotl_bytes}}
+            skdm_inner = _string_field(1, str(group_jid_obj)) + _length_delim(2, skdm_bytes)
+            skdm_message_proto = _length_delim(2, skdm_inner)
+            skdm_padded = pad_for_signal(skdm_message_proto)
+
+            # Fetch bundles for sessionless devices in one batch.
+            no_session_devices = [
+                d for d in targets if not signal.has_session(d.user, d.device)
+            ]
+            if no_session_devices:
+                log.info("fetching prekey bundles for %d device(s)", len(no_session_devices))
                 try:
-                    signal.install_prekey_bundle(d.user, d.device, **b)
+                    bundles = await _fetch_prekey_bundles(session, no_session_devices)
                 except Exception as e:
-                    log.warning("bundle install failed for %s: %s", d, e)
+                    log.warning("prekey fetch failed: %s", e)
+                    bundles = {}
+                for d in no_session_devices:
+                    b = bundles.get(d.ad_string())
+                    if not b:
+                        continue
+                    try:
+                        signal.install_prekey_bundle(d.user, d.device, **b)
+                    except Exception as e:
+                        log.warning("bundle install failed for %s: %s", d, e)
 
-        participant_children: list[Node] = []
-        any_pkmsg = False
-        skipped: list[str] = []
-        for dev in targets:
-            try:
-                ct, kind = signal.encrypt_msg(dev.user, dev.device, skdm_padded)
-            except Exception as e:
-                skipped.append(f"{dev.user}:{dev.device}")
-                log.debug("skipping %s: %s", dev, e)
-                continue
-            if kind == "pkmsg":
-                any_pkmsg = True
-            participant_children.append(
-                Node(
-                    tag="to",
-                    attrs={"jid": dev},
-                    content=[Node(tag="enc", attrs={"v": "2", "type": kind}, content=ct)],
-                )
-            )
-        if skipped:
-            log.warning("skipped %d device(s) with no encryptable session", len(skipped))
-        if not participant_children:
-            click.echo(
-                click.style("no encryptable participants — aborting", fg="red"),
-                err=True,
-            )
-            raise SystemExit(1)
-
-        # 5. Encrypt the actual user message via group cipher. A document
-        # send swaps the conversation plaintext for a DocumentMessage; the
-        # single skmsg covers every participant incl. our own devices, so no
-        # deviceSentMessage wrap is needed here (unlike the DM path).
-        if doc_path:
-            from wa.messages import build_document_plaintext
-
-            doc, cache_text = await _upload_document(fs, ns, doc_path, text or None, make_thumb)
-            message_plaintext = build_document_plaintext(doc)
-        else:
-            cache_text = text
-            message_plaintext = _build_message_plaintext(text)
-        skmsg_padded = pad_for_signal(message_plaintext)
-        try:
-            skmsg_ct = signal.group_encrypt(
-                str(group_jid_obj), sender_user, own_self_device, skmsg_padded
-            )
-        except Exception as e:
-            click.echo(click.style(f"group encrypt failed: {e}", fg="red"), err=True)
-            raise SystemExit(1)
-
-        # 6. Build stanza. Group sends DO set `phash` (unlike DMs), and
-        # set `addressing_mode` to match the group's mode.
-        phash = _phash(all_devices)
-        msg_id = "3EB0" + secrets.token_hex(9).upper()
-        stanza_attrs: dict = {
-            "to": group_jid_obj,
-            "type": "media" if doc_path else "text",
-            "id": msg_id,
-            "phash": phash,
-            "addressing_mode": addressing_mode,
-        }
-        skmsg_attrs = {"v": "2", "type": "skmsg"}
-        if doc_path:
-            # Media payloads carry `mediatype` on the skmsg <enc> too, so
-            # recipients render the decrypted document.
-            skmsg_attrs["mediatype"] = "document"
-        content_nodes: list[Node] = [
-            Node(tag="participants", content=participant_children),
-            Node(tag="enc", attrs=skmsg_attrs, content=skmsg_ct),
-        ]
-        if any_pkmsg and device.account:
-            content_nodes.append(Node(tag="device-identity", content=device.account))
-        stanza = Node(tag="message", attrs=stanza_attrs, content=content_nodes)
-        await fs.send(ns.encrypt_frame(encode_node(stanza)))
-        log.info(
-            "sent skmsg id=%s to=%s participants=%d any_pkmsg=%s",
-            msg_id, group_jid, len(participant_children), any_pkmsg,
-        )
-
-        ack_dl = asyncio.get_event_loop().time() + 15.0
-        while asyncio.get_event_loop().time() < ack_dl:
-            try:
-                ct = await fs.recv(
-                    timeout=max(0.1, ack_dl - asyncio.get_event_loop().time())
-                )
-            except (asyncio.TimeoutError, ConnectionError):
-                break
-            try:
-                node = decode_node(ns.decrypt_frame(ct))
-            except Exception:
-                continue
-            if node.tag == "ack" and node.attrs.get("id") == msg_id:
-                ts = int(_time.time())
-                append_messages([
-                    CachedMessage(
-                        ts=ts,
-                        chat=group_jid,
-                        sender=str(own_pn) if own_pn.user else "",
-                        sender_name="me",
-                        text=cache_text,
-                        from_me=True,
-                        msg_id=msg_id,
+            participant_children: list[Node] = []
+            any_pkmsg = False
+            skipped: list[str] = []
+            for dev in targets:
+                try:
+                    ct, kind = signal.encrypt_msg(dev.user, dev.device, skdm_padded)
+                except Exception as e:
+                    skipped.append(f"{dev.user}:{dev.device}")
+                    log.debug("skipping %s: %s", dev, e)
+                    continue
+                if kind == "pkmsg":
+                    any_pkmsg = True
+                participant_children.append(
+                    Node(
+                        tag="to",
+                        attrs={"jid": dev},
+                        content=[Node(tag="enc", attrs={"v": "2", "type": kind}, content=ct)],
                     )
-                ])
-                upsert_chat(group_jid, last_ts=ts)
-                click.echo(click.style(f"sent: {msg_id}", fg="green"))
+                )
+            if skipped:
+                log.warning("skipped %d device(s) with no encryptable session", len(skipped))
+            if not participant_children:
+                click.echo(
+                    click.style("no encryptable participants — aborting", fg="red"),
+                    err=True,
+                )
+                raise SystemExit(1)
+
+            # 5. Encrypt the actual user message via group cipher. A document
+            # send swaps the conversation plaintext for a DocumentMessage; the
+            # single skmsg covers every participant incl. our own devices, so no
+            # deviceSentMessage wrap is needed here (unlike the DM path).
+            if doc_path:
+                from wa.messages import build_document_plaintext
+
+                doc, cache_text = await _upload_document(session, doc_path, text or None, make_thumb)
+                message_plaintext = build_document_plaintext(doc)
+            else:
+                cache_text = text
+                message_plaintext = _build_message_plaintext(text)
+            skmsg_padded = pad_for_signal(message_plaintext)
+            try:
+                skmsg_ct = signal.group_encrypt(
+                    str(group_jid_obj), sender_user, own_self_device, skmsg_padded
+                )
+            except Exception as e:
+                click.echo(click.style(f"group encrypt failed: {e}", fg="red"), err=True)
+                raise SystemExit(1)
+
+            # 6. Build stanza. Group sends DO set `phash` (unlike DMs), and
+            # set `addressing_mode` to match the group's mode.
+            phash = _phash(all_devices)
+            msg_id = "3EB0" + secrets.token_hex(9).upper()
+            stanza_attrs: dict = {
+                "to": group_jid_obj,
+                "type": "media" if doc_path else "text",
+                "id": msg_id,
+                "phash": phash,
+                "addressing_mode": addressing_mode,
+            }
+            skmsg_attrs = {"v": "2", "type": "skmsg"}
+            if doc_path:
+                # Media payloads carry `mediatype` on the skmsg <enc> too, so
+                # recipients render the decrypted document.
+                skmsg_attrs["mediatype"] = "document"
+            content_nodes: list[Node] = [
+                Node(tag="participants", content=participant_children),
+                Node(tag="enc", attrs=skmsg_attrs, content=skmsg_ct),
+            ]
+            if any_pkmsg and device.account:
+                content_nodes.append(Node(tag="device-identity", content=device.account))
+            stanza = Node(tag="message", attrs=stanza_attrs, content=content_nodes)
+            await session.send_node(stanza)
+            log.info(
+                "sent skmsg id=%s to=%s participants=%d any_pkmsg=%s",
+                msg_id, group_jid, len(participant_children), any_pkmsg,
+            )
+
+            try:
+                await session.wait_ack(msg_id, timeout=15.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                click.echo(
+                    click.style("no ack within 15s — message may or may not have been queued", fg="yellow"),
+                    err=True,
+                )
                 return
-        click.echo(
-            click.style("no ack within 15s — message may or may not have been queued", fg="yellow"),
-            err=True,
-        )
+            ts = int(_time.time())
+            append_messages([
+                CachedMessage(
+                    ts=ts,
+                    chat=group_jid,
+                    sender=str(own_pn) if own_pn.user else "",
+                    sender_name="me",
+                    text=cache_text,
+                    from_me=True,
+                    msg_id=msg_id,
+                )
+            ])
+            upsert_chat(group_jid, last_ts=ts)
+            click.echo(click.style(f"sent: {msg_id}", fg="green"))
+        finally:
+            await session.stop()
 
 
 async def _login_async(device: Device) -> None:
@@ -2445,7 +2382,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
 
 
 async def _fetch_group_participants(
-    fs: FrameSocket, ns, *, only_unnamed: bool = False
+    session: InboundSession, *, only_unnamed: bool = False
 ) -> None:
     """For every cached group, query its metadata and harvest display names.
 
@@ -2461,10 +2398,10 @@ async def _fetch_group_participants(
        ``WA_GROUPINFO_TTL_DAYS`` (default 7) are skipped — participant
        lists are essentially static between explicit ``w:gp2``
        notifications, so re-fetching them every login is pure waste.
-    2. **Pipelined IQs**. A single reader task demultiplexes replies by
-       ``iq_id``; up to ``WA_GROUPINFO_CONCURRENCY`` (default 10) requests
-       are in flight at once. With a typical ~150ms RTT the wall-clock
-       drops from ``N × 150ms`` to roughly ``N/10 × 150ms``.
+    2. **Pipelined IQs**. Up to ``WA_GROUPINFO_CONCURRENCY`` (default 10)
+       ``request_iq`` calls run at once on the shared inbound session.
+       With a typical ~150ms RTT the wall-clock drops from ``N × 150ms``
+       to roughly ``N/10 × 150ms``.
 
     With ``only_unnamed=True`` the function targets just groups whose
     ``chats.json`` entry has an empty ``name`` (newly-joined groups whose
@@ -2525,28 +2462,7 @@ async def _fetch_group_participants(
     if not groups:
         return
 
-    pending: dict[str, asyncio.Future] = {}
     new_count = 0
-    reader_stop = asyncio.Event()
-
-    async def reader() -> None:
-        # Dedicated frame reader: routes <iq> replies to their pending
-        # futures by id, drops anything else (no other phase is running).
-        while not reader_stop.is_set():
-            try:
-                ct = await fs.recv(timeout=0.5)
-            except (asyncio.TimeoutError, ConnectionError):
-                continue
-            try:
-                node = decode_node(ns.decrypt_frame(ct))
-            except Exception:
-                continue
-            if node.tag != "iq":
-                continue
-            iq_id = node.attrs.get("id")
-            fut = pending.get(iq_id)
-            if fut is not None and not fut.done():
-                fut.set_result(node)
 
     def _harvest(gid: str, node: Node) -> int:
         nonlocal new_count
@@ -2591,26 +2507,16 @@ async def _fetch_group_participants(
     async def fetch_one(gid: str) -> None:
         async with sem:
             iq_id = f"gi-{secrets.token_hex(4)}"
-            fut: asyncio.Future = asyncio.get_event_loop().create_future()
-            pending[iq_id] = fut
             iq = Node(
                 tag="iq",
                 attrs={"to": JID.parse(gid), "type": "get", "id": iq_id, "xmlns": "w:g2"},
                 content=[Node(tag="query", attrs={"request": "interactive"})],
             )
             try:
-                await fs.send(ns.encrypt_frame(encode_node(iq)))
-            except Exception as e:
-                log.warning("send failed for %s: %s", gid, e)
-                pending.pop(iq_id, None)
-                return
-            try:
-                node = await asyncio.wait_for(fut, timeout=5.0)
-            except asyncio.TimeoutError:
+                node = await session.request_iq(iq, timeout=5.0)
+            except (asyncio.TimeoutError, ConnectionError):
                 log.debug("group %s: no reply in 5s, skipping", gid)
                 return
-            finally:
-                pending.pop(iq_id, None)
             # Cache the fetch attempt regardless of outcome: an `<iq type="error">`
             # ("not-authorized" / "item-not-found") means you've left the group
             # or it no longer exists, and that state is very unlikely to flip
@@ -2623,16 +2529,7 @@ async def _fetch_group_participants(
                 return
             _harvest(gid, node)
 
-    reader_task = asyncio.create_task(reader())
-    try:
-        await asyncio.gather(*(fetch_one(g) for g in groups), return_exceptions=True)
-    finally:
-        reader_stop.set()
-        reader_task.cancel()
-        try:
-            await reader_task
-        except (asyncio.CancelledError, Exception):
-            pass
+    await asyncio.gather(*(fetch_one(g) for g in groups), return_exceptions=True)
 
     save_chats(chats)
     save_contacts(contacts)
@@ -2758,7 +2655,7 @@ async def _fetch_pushnames(fs: FrameSocket, ns) -> None:
     log.info("usync added %d pushNames to contacts", new_count)
 
 
-async def _upload_prekeys(fs: FrameSocket, ns, device: Device) -> None:
+async def _upload_prekeys(session: InboundSession, device: Device) -> None:
     """First-pair pre-key upload — sends the IQ and waits for the result.
 
     On success persists ``device.prekeys_uploaded = True`` so we don't repeat
@@ -2782,36 +2679,25 @@ async def _upload_prekeys(fs: FrameSocket, ns, device: Device) -> None:
     )
     log.info("uploading %d one-time pre-keys (id %d…%d)",
              len(batch), batch[0]["key_id"], batch[-1]["key_id"])
-    await fs.send(ns.encrypt_frame(encode_node(iq)))
-    # Poll for the matching IQ result; timebox to avoid hanging the connect.
-    deadline = asyncio.get_event_loop().time() + 10.0
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            ct = await fs.recv(timeout=max(0.1, deadline - asyncio.get_event_loop().time()))
-        except (asyncio.TimeoutError, ConnectionError):
-            log.warning("pre-key upload IQ — no result within timeout")
-            return
-        node = decode_node(ns.decrypt_frame(ct))
-        if node.tag == "iq" and node.attrs.get("id") == iq_id:
-            if node.attrs.get("type") == "result":
-                device.prekeys_uploaded = True
-                device.next_prekey_id += INITIAL_UPLOAD_COUNT
-                # Persist the private halves so future processes can decrypt
-                # incoming pkmsgs that reference these prekey IDs.
-                device.one_time_prekeys.extend(batch)
-                device.save()
-                log.info("pre-key upload accepted (%d privates persisted)", len(batch))
-            else:
-                log.warning("pre-key upload rejected:\n%s", _pretty(node))
-            return
-        # Stash anything else for the main post-success handler to deal with;
-        # for simplicity we just drop them here. Real client would queue.
-        log.debug("dropping out-of-order frame during prekey upload:\n%s", _pretty(node))
+    try:
+        node = await session.request_iq(iq, timeout=10.0)
+    except (asyncio.TimeoutError, ConnectionError):
+        log.warning("pre-key upload IQ — no result within timeout")
+        return
+    if node.attrs.get("type") == "result":
+        device.prekeys_uploaded = True
+        device.next_prekey_id += INITIAL_UPLOAD_COUNT
+        # Persist the private halves so future processes can decrypt
+        # incoming pkmsgs that reference these prekey IDs.
+        device.one_time_prekeys.extend(batch)
+        device.save()
+        log.info("pre-key upload accepted (%d privates persisted)", len(batch))
+    else:
+        log.warning("pre-key upload rejected:\n%s", _pretty(node))
 
 
 async def _post_success(
-    fs: FrameSocket,
-    ns,
+    session: InboundSession,
     device: Device,
     *,
     seconds: float = 60.0,
@@ -2820,64 +2706,33 @@ async def _post_success(
 ) -> None:
     """Behave like a real client after <success/>, drain the offline queue.
 
-    Sends the active-IQ the phone is waiting on, ACKs server-initiated IQs,
-    and attempts to Signal-decrypt any ``<enc>`` payloads so we can see the
-    peer content (typically app-state keys and history sync).
-
-    Termination is whichever happens first:
-
-    - ``idle`` seconds pass without any frame from the server (queue is
-      drained — we're caught up to "latest sync"). This is the normal exit.
-    - ``seconds`` total elapse (safety cap for pathological queues).
-
-    ``fetch_groups`` controls whether to query every cached group's
-    participant list before draining. Disabled by `wa sync`.
+    The inbound session already owns ``recv``. This function only sends
+    the active-IQ, optional group-info queries, and waits for idle or
+    the hard cap. Messages that arrive during those IQs are decrypted
+    and ACK'd by the session, not dropped.
     """
-    from wa.wabinary.jid import JID as _JID
-
     log = logging.getLogger("login")
-    server_jid = _JID(server="s.whatsapp.net")
-    signal = SignalSession(device)
-    # Cached own JIDs for self-vs-peer classification on incoming
-    # `<message>` frames when we send `<receipt>` back.
-    own_pn = JID.parse(device.jid) if device.jid else JID()
-    own_lid = JID.parse(device.lid) if device.lid else None
 
     # First-pair: upload one-time prekeys so the phone's UI can resolve.
-    # The phone's "Linked Devices" dialog stays in "connecting…" state
-    # until the server reports we have a healthy pre-key bundle on file.
     if not device.prekeys_uploaded:
-        await _upload_prekeys(fs, ns, device)
+        await _upload_prekeys(session, device)
 
     active_iq = Node(
         tag="iq",
         attrs={
-            "to": server_jid,
+            "to": JID(server="s.whatsapp.net"),
             "type": "set",
             "id": "set-active-1",
             "xmlns": "passive",
         },
         content=[Node(tag="active")],
     )
-    await fs.send(ns.encrypt_frame(encode_node(active_iq)))
-    # Wait for the server to confirm our active state. Group-info IQs sent
-    # before this is acknowledged get silently dropped (server still treats
-    # us as passive at the time of receipt).
-    active_deadline = asyncio.get_event_loop().time() + 5.0
-    while asyncio.get_event_loop().time() < active_deadline:
-        try:
-            ct = await fs.recv(timeout=0.5)
-        except (asyncio.TimeoutError, ConnectionError):
-            break
-        try:
-            n = decode_node(ns.decrypt_frame(ct))
-        except Exception:
-            continue
-        if n.tag == "iq" and n.attrs.get("id") == "set-active-1":
-            log.debug("active state confirmed")
-            break
-        log.debug("pre-active drain: %s id=%s", n.tag, n.attrs.get("id"))
-    await _send_presence_available(fs, ns, device)
+    try:
+        await session.request_iq(active_iq, timeout=5.0)
+        log.debug("active state confirmed")
+    except (asyncio.TimeoutError, ConnectionError):
+        log.debug("active IQ unconfirmed")
+    await _send_presence_available(session.fs, session.ns, device)
     if fetch_groups:
         click.echo(
             click.style(
@@ -2885,104 +2740,12 @@ async def _post_success(
                 fg="green",
             )
         )
-        await _fetch_group_participants(fs, ns)
+        await _fetch_group_participants(session)
     else:
-        # Skip the full TTL-aware refresh but still resolve names for any
-        # groups we've recently joined (chats.json has the JID but no
-        # subject). Cheap — typically 0 groups, occasionally a couple.
-        await _fetch_group_participants(fs, ns, only_unnamed=True)
+        await _fetch_group_participants(session, only_unnamed=True)
         click.echo(click.style("authenticated — draining offline queue...", fg="green"))
 
-    # Idle-timeout drain. We don't know in advance how much queued mail
-    # the server will replay, so commit to a hard wall (`seconds`) but
-    # exit early as soon as the server goes quiet for `idle` seconds —
-    # at that point the offline queue is empty and we're caught up.
-    started = asyncio.get_event_loop().time()
-    hard_deadline = started + seconds
-    last_frame_ts = started
-    frames_seen = 0
-    while True:
-        now = asyncio.get_event_loop().time()
-        if now >= hard_deadline:
-            log.info("hit hard cap of %.0fs (received %d frames)", seconds, frames_seen)
-            break
-        if now - last_frame_ts >= idle:
-            log.info(
-                "queue idle for %.1fs after %d frames — caught up",
-                idle, frames_seen,
-            )
-            break
-        # Wake at whichever boundary comes first (idle or hard cap), so we
-        # never block past either.
-        wait = min(idle - (now - last_frame_ts), hard_deadline - now)
-        try:
-            ct = await fs.recv(timeout=max(0.1, wait))
-        except (asyncio.TimeoutError, ConnectionError):
-            continue
-        try:
-            node = decode_node(ns.decrypt_frame(ct))
-        except Exception as e:
-            log.warning("failed to decode frame: %s", e)
-            continue
-        last_frame_ts = asyncio.get_event_loop().time()
-        frames_seen += 1
-        log.debug("post-success frame:\n%s", _pretty(node))
-        # Try to decrypt any <enc> inside <message>; log plaintext metadata.
-        if node.tag == "message":
-            _try_decrypt_message(node, signal)
-        # Server-initiated messages and notifications need an <ack> with
-        # class=<tag>; this is the transport-level confirm that dequeues
-        # offline deliveries. Without it the server keeps redelivering.
-        if node.tag in ("message", "notification", "call", "receipt"):
-            ack_attrs = {
-                "class": node.tag,
-                "id": node.attrs.get("id", ""),
-                "to": node.attrs.get("from", server_jid),
-            }
-            for k in ("participant", "recipient"):
-                if k in node.attrs:
-                    ack_attrs[k] = node.attrs[k]
-            if node.tag != "message" and "type" in node.attrs:
-                ack_attrs["type"] = node.attrs["type"]
-            ack = Node(tag="ack", attrs=ack_attrs)
-            await fs.send(ns.encrypt_frame(encode_node(ack)))
-        # The sender's "delivered ✓✓" indicator requires a <receipt> back
-        # to them — separate from the transport <ack> above. Without
-        # this, WhatsApp keeps re-queueing the same messages on every
-        # connection because it never learns we received them. Type
-        # `sender` for our own device-sent messages (echoes from other
-        # linked devices), no type for peer messages = "delivered".
-        if node.tag == "message":
-            sender = node.attrs.get("participant") or node.attrs.get("from")
-            is_own_echo = (
-                isinstance(sender, JID)
-                and sender.user
-                in {own_pn.user, (own_lid.user if own_lid else None)}
-            )
-            receipt_attrs = {
-                "id": node.attrs.get("id", ""),
-                "to": node.attrs.get("from", server_jid),
-            }
-            for k in ("participant", "recipient"):
-                if k in node.attrs:
-                    receipt_attrs[k] = node.attrs[k]
-            if is_own_echo:
-                receipt_attrs["type"] = "sender"
-            await fs.send(
-                ns.encrypt_frame(encode_node(Node(tag="receipt", attrs=receipt_attrs)))
-            )
-        # ACK every server-initiated IQ so we don't look unresponsive.
-        if node.tag == "iq" and node.attrs.get("type") == "set":
-            ack = Node(
-                tag="iq",
-                attrs={
-                    "to": node.attrs.get("from", server_jid),
-                    "id": node.attrs.get("id", ""),
-                    "type": "result",
-                },
-            )
-            await fs.send(ns.encrypt_frame(encode_node(ack)))
-    # Record successful drain so `wa status` can show how stale we are.
+    frames_seen = await session.drain(seconds=seconds, idle=idle)
     try:
         import time as _time
 
@@ -3051,103 +2814,61 @@ async def _extend_chat(chat_jid: str, count: int) -> int:
             if node.tag == "failure":
                 raise RuntimeError("login failed")
 
-        # Active IQ.
-        active = Node(
-            tag="iq",
-            attrs={
-                "to": JID(server="s.whatsapp.net"),
-                "type": "set",
-                "id": "ext-act",
-                "xmlns": "passive",
-            },
-            content=[Node(tag="active")],
-        )
-        await fs.send(ns.encrypt_frame(encode_node(active)))
-        # Drain until active is confirmed (so the request isn't dropped).
-        active_dl = asyncio.get_event_loop().time() + 5.0
-        while asyncio.get_event_loop().time() < active_dl:
-            try:
-                ct = await fs.recv(timeout=0.5)
-            except (asyncio.TimeoutError, ConnectionError):
-                break
-            n = decode_node(ns.decrypt_frame(ct))
-            if n.tag == "iq" and n.attrs.get("id") == "ext-act":
-                break
-        await _send_presence_available(fs, ns, device)
-
-        # Encrypt to our own *LID* device 0 (whatsmeow does the same — peer
-        # messages go to the LID identity, even though the wire-level `to`
-        # attribute is the PN form). Two session entries exist in our store:
-        # the PN-keyed one and the LID-keyed one. We pick LID per the
-        # whatsmeow reference.
-        signal = SignalSession(device)
-        own_pn = JID.parse(device.jid)
-        own_lid = JID.parse(device.lid) if device.lid else None
-        if own_lid is not None:
-            ciphertext, kind = signal.encrypt_msg(own_lid.user, 0, padded)
-        else:
-            ciphertext, kind = signal.encrypt_msg(own_pn.user, 0, padded)
-        peer_msg = Node(
-            tag="message",
-            attrs={
-                "to": JID(user=own_pn.user, server="s.whatsapp.net"),
-                "category": "peer",
-                "type": "text",
-                # WhatsApp message IDs are uppercase hex of length 22 prefixed
-                # with 3EB0 for outgoing client-generated. The server filters
-                # off-format IDs from peer routing.
-                "id": "3EB0" + secrets.token_hex(9).upper(),
-                # On-demand history requests need these flags or the phone
-                # quietly drops them (per whatsmeow preparePeerMessageNode).
-                "push_priority": "high_force",
-                "privacy_sensitive": "1",
-            },
-            content=[
-                Node(tag="meta", attrs={"appdata": "default"}),
-                Node(tag="enc", attrs={"v": "2", "type": kind}, content=ciphertext),
-            ],
-        )
-        await fs.send(ns.encrypt_frame(encode_node(peer_msg)))
-        log.info("on-demand request sent (%s, %d-byte payload)", kind, len(ciphertext))
-
-        # Drain incoming messages for ~20s. We only care about peer
-        # messages whose decryption yields a HistorySyncNotification blob;
-        # the regular _try_decrypt_message hook persists those to disk.
-        signal_for_decrypt = SignalSession(device)
-        log.info("listening for history reply (60s)...")
-        listen_dl = asyncio.get_event_loop().time() + 60.0
-        while asyncio.get_event_loop().time() < listen_dl:
-            try:
-                ct = await fs.recv(timeout=max(0.1, listen_dl - asyncio.get_event_loop().time()))
-            except (asyncio.TimeoutError, ConnectionError):
-                break
-            try:
-                node = decode_node(ns.decrypt_frame(ct))
-            except Exception as e:
-                log.debug("decode skip: %s", e)
-                continue
-            log.debug(
-                "rx %s id=%s from=%s type=%s category=%s",
-                node.tag,
-                node.attrs.get("id"),
-                node.attrs.get("from"),
-                node.attrs.get("type"),
-                node.attrs.get("category"),
+        session, signal = _open_inbound(fs, ns, device)
+        try:
+            active = Node(
+                tag="iq",
+                attrs={
+                    "to": JID(server="s.whatsapp.net"),
+                    "type": "set",
+                    "id": "ext-act",
+                    "xmlns": "passive",
+                },
+                content=[Node(tag="active")],
             )
-            if node.tag == "message":
-                _try_decrypt_message(node, signal_for_decrypt)
-                # ack so server stops redelivering
-                ack = Node(
-                    tag="ack",
-                    attrs={
-                        "class": "message",
-                        "id": node.attrs.get("id", ""),
-                        "to": node.attrs.get("from", JID(server="s.whatsapp.net")),
-                    },
-                )
-                if "participant" in node.attrs:
-                    ack.attrs["participant"] = node.attrs["participant"]
-                await fs.send(ns.encrypt_frame(encode_node(ack)))
+            try:
+                await session.request_iq(active, timeout=5.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                log.debug("active IQ unconfirmed")
+            await _send_presence_available(fs, ns, device)
+
+            # Encrypt to our own *LID* device 0 (whatsmeow does the same — peer
+            # messages go to the LID identity, even though the wire-level `to`
+            # attribute is the PN form). Two session entries exist in our store:
+            # the PN-keyed one and the LID-keyed one. We pick LID per the
+            # whatsmeow reference.
+            own_pn = JID.parse(device.jid)
+            own_lid = JID.parse(device.lid) if device.lid else None
+            if own_lid is not None:
+                ciphertext, kind = signal.encrypt_msg(own_lid.user, 0, padded)
+            else:
+                ciphertext, kind = signal.encrypt_msg(own_pn.user, 0, padded)
+            peer_msg = Node(
+                tag="message",
+                attrs={
+                    "to": JID(user=own_pn.user, server="s.whatsapp.net"),
+                    "category": "peer",
+                    "type": "text",
+                    # WhatsApp message IDs are uppercase hex of length 22 prefixed
+                    # with 3EB0 for outgoing client-generated. The server filters
+                    # off-format IDs from peer routing.
+                    "id": "3EB0" + secrets.token_hex(9).upper(),
+                    # On-demand history requests need these flags or the phone
+                    # quietly drops them (per whatsmeow preparePeerMessageNode).
+                    "push_priority": "high_force",
+                    "privacy_sensitive": "1",
+                },
+                content=[
+                    Node(tag="meta", attrs={"appdata": "default"}),
+                    Node(tag="enc", attrs={"v": "2", "type": kind}, content=ciphertext),
+                ],
+            )
+            await session.send_node(peer_msg)
+            log.info("on-demand request sent (%s, %d-byte payload)", kind, len(ciphertext))
+            log.info("listening for history reply (60s)...")
+            await session.drain(seconds=60.0, idle=60.0)
+        finally:
+            await session.stop()
 
     # Now process any new blobs into the cache.
     blobs_after = _count_blob_files()
@@ -3208,14 +2929,17 @@ async def _login_handshake(
                 return
             node = decode_node(ns.decrypt_frame(ct))
             if node.tag == "success":
-                await _post_success(
-                    fs,
-                    ns,
-                    device,
-                    seconds=seconds,
-                    idle=idle,
-                    fetch_groups=fetch_groups,
-                )
+                session, _signal = _open_inbound(fs, ns, device)
+                try:
+                    await _post_success(
+                        session,
+                        device,
+                        seconds=seconds,
+                        idle=idle,
+                        fetch_groups=fetch_groups,
+                    )
+                finally:
+                    await session.stop()
                 return
             if node.tag == "failure":
                 click.echo(
