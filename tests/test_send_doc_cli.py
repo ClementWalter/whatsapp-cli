@@ -41,12 +41,17 @@ class _IdentityNS:
         return b
 
 
+class _Dev:
+    jid = "33123456789:23@s.whatsapp.net"
+    lid = ""
+
+
 class _ReplyFS:
     """FrameSocket stub that answers a media_conn IQ echoing the sent id."""
 
     def __init__(self, media_conn: Node):
         self._media_conn = media_conn
-        self._reply: bytes | None = None
+        self._incoming: asyncio.Queue = asyncio.Queue()
 
     async def send(self, frame):
         sent = cli.decode_node(frame)
@@ -55,14 +60,25 @@ class _ReplyFS:
             attrs={"id": sent.attrs["id"], "type": "result"},
             content=[self._media_conn],
         )
-        self._reply = encode_node(reply)
+        await self._incoming.put(encode_node(reply))
 
     async def recv(self, timeout=0):
-        return self._reply
+        return await asyncio.wait_for(self._incoming.get(), timeout)
 
 
 def _run_media_conn(media_conn: Node):
-    return asyncio.run(_fetch_media_conn(_ReplyFS(media_conn), _IdentityNS()))
+    from wa.session import InboundSession
+
+    async def _inner():
+        fs = _ReplyFS(media_conn)
+        session = InboundSession(fs, _IdentityNS(), _Dev())
+        session.start()
+        try:
+            return await _fetch_media_conn(session)
+        finally:
+            await session.stop()
+
+    return asyncio.run(_inner())
 
 
 def test_fetch_media_conn_parses_hosts():
