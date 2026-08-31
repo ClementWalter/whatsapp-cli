@@ -1,6 +1,6 @@
 ---
 name: whatsapp-cli
-description: "Read and write your own WhatsApp chats from the terminal via the bundled `wa` command. Pairs as a linked device (one-time QR scan); then `wa sync` catches up the offline queue, `wa chats` lists conversations, `wa read <name>` shows a thread, `wa send <peer> \"<text>\"` sends a 1:1 or group message, and `wa send <peer> --doc <path>` shares a document (PDF or any file). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
+description: "Read and write your own WhatsApp chats from the terminal via the bundled `wa` command. Pairs as a linked device (one-time QR scan); then `wa pull` (alias `sync`) catches up the offline queue, `wa list` (alias `chats`) lists conversations, `wa read <name>` shows a thread, `wa send <peer> \"<text>\"` sends a 1:1 or group message, and `wa send <peer> --doc <path>` shares a document (PDF or any file). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
 ---
 
 # WhatsApp User CLI
@@ -16,7 +16,7 @@ repo's `bin/wa`, so it always runs the current checkout: a `git pull`, or even
 an uncommitted edit, takes effect immediately with nothing to reinstall.
 
 ```bash
-wa chats
+wa list
 ```
 
 Examples in this doc are written that way. If `wa` is not on `$PATH`, run the
@@ -39,10 +39,10 @@ either way. The `pyproject.toml` here exists for the test group
 Trigger this skill when the user wants to:
 
 - read their own WhatsApp messages (`wa read alice`)
-- catch up after being offline (`wa sync`)
+- catch up after being offline (`wa pull`)
 - send a 1:1 or group message (`wa send "Pierre" "hello"`)
 - share a document / PDF (`wa send "Pierre" --doc report.pdf`)
-- list, search, or count their chats programmatically (`wa chats --json`)
+- list, search, or count their chats programmatically (`wa list --json`)
 - check whether the CLI is paired or how recent the last sync was (`wa status`)
 
 Do **not** use it when the user wants to operate on someone else's account,
@@ -76,39 +76,39 @@ the top level (`wa --debug ...`) for verbose protocol logs.
 Show pairing state and last sync. Use to verify the user is set up before
 running any other command.
 
-### `wa sync [--seconds N] [--idle N] [--refresh-groups]`
-Reconnect, drain the offline-message queue, exit when the queue goes idle for
+### `wa pull` / `wa sync` `[--seconds N] [--idle N] [--refresh-groups]`
+Reconnect, drain the **server** mailbox, exit when the queue goes idle for
 `--idle` seconds (default 3). `--seconds` is a hard cap (default 120). Use
-before `wa chats` / `wa read` if the user wants fresh data.
+before `wa list` / `wa read` if the user wants fresh data. `sync` is an alias.
 
 ```bash
-wa sync                  # quick catch-up, ~3-30s depending on backlog
-wa sync --seconds 300    # bigger cap after weeks offline
+wa pull                  # quick catch-up, ~3-30s depending on backlog
+wa pull --seconds 300    # bigger cap after weeks offline
 ```
 
-`sync` only ingests what the **server** has queued. It reports `0 frames —
+`pull` only ingests what the **server** has queued. It reports `0 frames —
 caught up` and exits after `--idle` seconds of silence, which is correct for
 queued mail but useless when you are waiting on the **phone** — use
-`wa history` for that.
+`wa backfill` for that.
 
-### `wa history [--minutes N]`
-Hold a connection open (default 15 min, idle exit disabled) so the phone can
+### `wa backfill` / `wa history` `[--minutes N]`
+Hold the socket open (default 15 min, idle exit disabled) so the phone can
 push chat-history sync bundles. Tell the user to open WhatsApp on their phone
 **in the foreground with the screen kept awake** for the whole window — the
-phone only serves history while both ends are live ("la synchro reprendra
-lorsque WhatsApp sera ouvert sur les deux appareils"), and `sync`'s 3-second
-idle exit closes the socket long before it starts pushing.
+phone only serves history while both ends are live, and `pull`'s 3-second
+idle exit closes the socket long before it starts pushing. `history` is an alias.
 
 ```bash
-wa history                 # 15-minute window
-wa history --minutes 30    # longer, for a big backfill
+wa backfill                 # 15-minute window
+wa backfill --minutes 30    # longer, for a big backfill
 ```
 
 Reach for it when a chat is visibly missing recent messages. See
 **Recovering missing messages** below for when it can't help.
 
-### `wa chats [--limit N] [--json]`
-List conversations sorted by most recent activity. Default limit 20.
+### `wa list` / `wa chats` `[--limit N] [--json]`
+List the local conversation cache, sorted by most recent activity. Default
+limit 20. Offline — does not open a socket. `chats` is an alias.
 
 ```
 2026-05-12  dm     Alice               123456789012345@lid
@@ -233,7 +233,7 @@ shows the plan.
 ### `wa login [--reset]`
 Pair as a linked device. First time: scans a QR code. With `--reset`:
 wipes existing keys and starts fresh (forces a new QR). For already-paired
-devices, this runs the same drain as `wa sync` but with a full
+devices, this runs the same drain as `wa pull` but with a full
 group-info refresh that resolves all contact display names from group
 participants (slower — ~5s cold, ~0s warm).
 
@@ -241,20 +241,20 @@ participants (slower — ~5s cold, ~0s warm).
 
 ### "Catch me up, what's been happening?"
 ```bash
-wa sync && bin/wa chats --limit 30
+wa pull && wa list --limit 30
 ```
 
 ### "A chat is missing its latest messages"
 ```bash
-wa history --minutes 15    # user must foreground WhatsApp on the phone now
+wa backfill --minutes 15    # user must foreground WhatsApp on the phone now
 wa read "<name>" --no-extend
 ```
-See **Recovering missing messages** — if `history` returns nothing new, the
+See **Recovering missing messages** — if `backfill` returns nothing new, the
 messages were never encrypted for this device and only the phone has them.
 
 ### "Show me messages from <someone>"
 ```bash
-wa sync && bin/wa read "<their name>" --limit 100
+wa pull && wa read "<their name>" --limit 100
 ```
 
 ### "Send a message to <someone>"
@@ -269,7 +269,7 @@ wa send "<number>@s.whatsapp.net" "<message text>"   # 1:1 / self-send
 
 ### "Find a chat by partial name"
 ```bash
-wa chats --json --limit 500 | jq '.[] | select(.display_name | test("theo"; "i"))'
+wa list --json --limit 500 | jq '.[] | select(.display_name | test("theo"; "i"))'
 ```
 
 ### "Get all messages from a chat as JSON for further processing"
@@ -289,7 +289,7 @@ wa read "alice" --limit 1000 --json --no-extend
 
 A chat that stops days or weeks before the phone shows. Diagnose it in this
 order — the three causes need different fixes, and two of them are
-unfixable, so don't burn rounds re-running `sync`.
+unfixable, so don't burn rounds re-running `pull`.
 
 **First, confirm the messages really are absent** rather than filed under a
 JID you didn't read. Query the raw store, not the rendered output:
@@ -306,7 +306,7 @@ jq -rc 'select(.chat|test("<jid-fragment>"))|[.ts,(.sender_name//"")]|@tsv' \
 If the store is current for other chats but stale for this one, delivery is
 the problem, not display.
 
-1. **Chat-history sync paused on the phone** → fixable. `wa history`,
+1. **Chat-history sync paused on the phone** → fixable. `wa backfill`,
    with WhatsApp foregrounded on the phone for the whole window.
 2. **The sender's client holds a stale device list** → not fixable
    retroactively. A 1:1 message only reaches a companion device if the
@@ -325,15 +325,15 @@ evidence that the local store matches the phone.
 
 - **Single connection at a time.** A file lock prevents two `wa`
   processes from connecting simultaneously; the second one blocks until
-  the first finishes. This includes `history`, which holds it for its whole
+  the first finishes. This includes `backfill`, which holds it for its whole
   window — don't try to `read --limit` in parallel, and stub
   `wa.cache.connection_lock` in tests so the suite never waits on a live
   session.
-- **No daemon.** Messages only land locally when you run `wa sync`
+- **No daemon.** Messages only land locally when you run `wa pull`
   (or any other connecting command). There's no push. Consequence worth
   internalising: the phone only serves chat history while a companion is
   *concurrently* connected, so any window this CLI opens is a few seconds
-  wide unless you ask for one explicitly (`wa history`).
+  wide unless you ask for one explicitly (`wa backfill`).
 - **`(unnamed)` chats are normal initially.** WhatsApp's app-state
   doesn't ship contact labels to linked devices; run
   `wa import-contacts` (macOS) or let group-info backfill resolve
