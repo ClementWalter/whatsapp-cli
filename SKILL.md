@@ -139,9 +139,6 @@ Each `--json` message carries `msg_id` and `quoted_id`: `quoted_id` is the
 otherwise. Plain output renders a quote as `↩︎ «snippet» text`. That is how a
 script tells "he answered *this* message" from "he wrote in the same chat".
 
-```bash
-```
-
 Auto-extends from the user's phone if the cache is shorter than `--limit`;
 pass `--no-extend` to disable that network round-trip.
 
