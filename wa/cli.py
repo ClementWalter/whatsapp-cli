@@ -249,6 +249,7 @@ def ingest(download: bool) -> None:
                         text=m.text,
                         from_me=m.from_me,
                         msg_id=m.msg_id,
+                        quoted_id=m.quoted_id,
                     )
                 )
 
@@ -676,6 +677,7 @@ def read(
                             "text": m.text,
                             "from_me": m.from_me,
                             "msg_id": m.msg_id,
+                            "quoted_id": m.quoted_id,
                         }
                         for m in rows
                     ],
@@ -690,10 +692,16 @@ def read(
 
     chat_label = chat_info.get("name") or chat_jid
     click.echo(click.style(f"# {chat_label}  ({chat_jid}) — {len(rows)} messages", fg="green"))
+    by_id = {m.msg_id: m for m in rows if m.msg_id}
     for m in rows:
         ts = datetime.fromtimestamp(m.ts).strftime("%Y-%m-%d %H:%M")
         who = "me" if m.from_me else resolve(m.sender, m.sender_name)
         text = m.text or "[non-text]"
+        if m.quoted_id:
+            # Show what a reply quotes, like the phone does above the bubble.
+            quoted = by_id.get(m.quoted_id)
+            snippet = (quoted.text[:40] + "…") if quoted and len(quoted.text) > 40 else (quoted.text if quoted else m.quoted_id)
+            text = f"↩︎ «{snippet}» {text}"
         click.echo(f"{ts}  {who}: {text}")
 
 
@@ -878,7 +886,14 @@ cli.add_command(history, "history")
     is_flag=True,
     help="Skip generating the inline preview thumbnail for --doc.",
 )
-def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool) -> None:
+@click.option(
+    "--reply-to",
+    "reply_to",
+    default=None,
+    metavar="MSG_ID",
+    help="Quote a cached message (its msg_id from `wa read --json`) — the phone shows TEXT as a reply to it.",
+)
+def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool, reply_to: str | None) -> None:
     """Send a text message — or a document — to a 1:1 chat or group.
 
     ``peer`` is a name (resolved against your cached chats, same substring
@@ -939,12 +954,32 @@ def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool) -> None
 
     from wa.cache import connection_lock
 
+    reply = _resolve_reply(reply_to, peer_jid) if reply_to else None
     make_thumb = not no_thumbnail
     with connection_lock():
         if peer_jid.endswith("@g.us"):
-            asyncio.run(_send_group_async(dev, peer_jid, text, doc_path, make_thumb))
+            asyncio.run(_send_group_async(dev, peer_jid, text, doc_path, make_thumb, reply))
         else:
-            asyncio.run(_send_async(dev, peer_jid, text, doc_path, make_thumb))
+            asyncio.run(_send_async(dev, peer_jid, text, doc_path, make_thumb, reply))
+
+
+def _resolve_reply(msg_id: str, peer_jid: str) -> "QuotedRef":
+    """Look a cached message up by id so the reply can quote it faithfully."""
+    from wa.cache import canonical_jid, iter_messages
+    from wa.messages import QuotedRef
+
+    # The cache keys DMs by their canonical @lid, while the peer may be given as a PN JID.
+    peer_jid = canonical_jid(peer_jid)
+    for m in iter_messages():
+        if m.msg_id == msg_id:
+            if m.chat != peer_jid:
+                click.echo(
+                    click.style(f"{msg_id} belongs to chat {m.chat}, not {peer_jid}", fg="red"), err=True
+                )
+                raise SystemExit(1)
+            return QuotedRef.from_cached(m.msg_id, m.sender, m.text)
+    click.echo(click.style(f"no cached message with id {msg_id} — `wa read <chat> --json` lists ids", fg="red"), err=True)
+    raise SystemExit(1)
 
 
 def _phash(devices: list[JID]) -> str:
@@ -1335,6 +1370,7 @@ async def _send_async(
     text: str,
     doc_path: str | None = None,
     make_thumb: bool = True,
+    reply: "QuotedRef | None" = None,
 ) -> None:
     """Single-shot send: login, usync devices, encrypt per device, transmit, ack.
 
@@ -1422,7 +1458,12 @@ async def _send_async(
     # needs the authenticated socket); ``cache_text`` is what `wa read` shows.
     stanza_type = "media" if doc_path else "text"
     cache_text = text
-    if not doc_path:
+    if not doc_path and reply is not None:
+        from wa.messages import build_reply_plaintext, wrap_device_sent
+
+        msg_plaintext = build_reply_plaintext(text, reply.msg_id, reply.participant, reply.text)
+        dsm_plaintext = wrap_device_sent(msg_plaintext, dsm_dest)
+    elif not doc_path:
         msg_plaintext = _build_message_plaintext(text)
         dsm_plaintext = _build_dsm_plaintext(text, dsm_dest)
 
@@ -1679,6 +1720,7 @@ async def _send_async(
                     text=cache_text,
                     from_me=True,
                     msg_id=msg_id,
+                    quoted_id=reply.msg_id if reply else "",
                 )
             ])
             upsert_chat(cache_jid, last_ts=ts)
@@ -1731,6 +1773,7 @@ async def _send_group_async(
     text: str,
     doc_path: str | None = None,
     make_thumb: bool = True,
+    reply: "QuotedRef | None" = None,
 ) -> None:
     """Send a text or document message to a group via Sender Keys + skmsg.
 
@@ -1905,6 +1948,11 @@ async def _send_group_async(
 
                 doc, cache_text = await _upload_document(session, doc_path, text or None, make_thumb)
                 message_plaintext = build_document_plaintext(doc)
+            elif reply is not None:
+                from wa.messages import build_reply_plaintext
+
+                cache_text = text
+                message_plaintext = build_reply_plaintext(text, reply.msg_id, reply.participant, reply.text)
             else:
                 cache_text = text
                 message_plaintext = _build_message_plaintext(text)
@@ -1964,6 +2012,7 @@ async def _send_group_async(
                     text=cache_text,
                     from_me=True,
                     msg_id=msg_id,
+                    quoted_id=reply.msg_id if reply else "",
                 )
             ])
             upsert_chat(group_jid, last_ts=ts)
@@ -2327,6 +2376,8 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             try:
                 from wa.cache import CachedMessage, append_messages, upsert_chat
 
+                from wa.messages import extract_quoted_id
+
                 append_messages([
                     CachedMessage(
                         ts=ts,
@@ -2336,6 +2387,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                         text=pretty,
                         from_me=False,
                         msg_id=msg_id,
+                        quoted_id=extract_quoted_id(pt),
                     )
                 ])
                 upsert_chat(chat_jid, last_ts=ts)

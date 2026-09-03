@@ -134,6 +134,14 @@ wa read alice --no-extend       # offline, cached only — no network
 wa read alice --json            # machine-readable
 ```
 
+Each `--json` message carries `msg_id` and `quoted_id`: `quoted_id` is the
+`msg_id` of the message a reply quotes (the "reply" bubble on the phone), `""`
+otherwise. Plain output renders a quote as `↩︎ «snippet» text`. That is how a
+script tells "he answered *this* message" from "he wrote in the same chat".
+
+```bash
+```
+
 Auto-extends from the user's phone if the cache is shorter than `--limit`;
 pass `--no-extend` to disable that network round-trip.
 
@@ -182,6 +190,7 @@ wa send 33123456789@s.whatsapp.net "test"     # self-send (explicit JID)
 wa send "Football" "see you at 7pm"           # group (Sender Keys)
 wa send "Pierre" --doc report.pdf             # share a document (any file)
 wa send "Pierre" "see attached" --doc report.pdf   # document + caption
+wa send "Pierre" "yes, go ahead" --reply-to 3EB0ABCDEF0123456789AB   # quote a message (msg_id from `wa read --json`)
 ```
 
 `--doc <path>` encrypts the file, uploads it to WhatsApp's media CDN, and
