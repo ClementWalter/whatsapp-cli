@@ -250,6 +250,7 @@ def ingest(download: bool) -> None:
                         from_me=m.from_me,
                         msg_id=m.msg_id,
                         quoted_id=m.quoted_id,
+                        media=m.media,
                     )
                 )
 
@@ -678,6 +679,7 @@ def read(
                             "from_me": m.from_me,
                             "msg_id": m.msg_id,
                             "quoted_id": m.quoted_id,
+                            "media": m.media,
                         }
                         for m in rows
                     ],
@@ -703,6 +705,37 @@ def read(
             snippet = (quoted.text[:40] + "…") if quoted and len(quoted.text) > 40 else (quoted.text if quoted else m.quoted_id)
             text = f"↩︎ «{snippet}» {text}"
         click.echo(f"{ts}  {who}: {text}")
+
+
+@cli.command()
+@click.argument("msg_id")
+@click.option("-o", "--output", "output", type=click.Path(dir_okay=True), default=None, help="File or directory to write to (default: ./<msg_id><ext>).")
+def download(msg_id: str, output: str | None) -> None:
+    """Download and decrypt a cached attachment (voice note, image, video, document).
+
+    ``msg_id`` comes from `wa read <chat> --json` (messages whose ``media`` is
+    not null). The blob is fetched from WhatsApp's CDN with the message's own
+    media key, verified, decrypted and written to disk; the path is printed.
+    Voice notes are Ogg/Opus (``.ogg``).
+    """
+    from pathlib import Path
+
+    from wa.cache import iter_messages
+    from wa.media import download_media, media_extension
+
+    msg = next((m for m in iter_messages() if m.msg_id == msg_id), None)
+    if msg is None:
+        click.echo(click.style(f"no cached message with id {msg_id}", fg="red"), err=True)
+        raise SystemExit(1)
+    if not msg.media:
+        click.echo(click.style(f"{msg_id} carries no downloadable media ({msg.text or 'text'})", fg="red"), err=True)
+        raise SystemExit(1)
+    name = msg.media.get("file_name") or f"{msg_id}{media_extension(msg.media)}"
+    target = Path(output) if output else Path(name)
+    if target.is_dir():
+        target = target / name
+    target.write_bytes(download_media(msg.media))
+    click.echo(str(target))
 
 
 @cli.command()
@@ -2151,12 +2184,12 @@ def _extract_text(plaintext: bytes, _depth: int = 0) -> str:
         except Exception:
             pass
 
-    # Media captions — image (3), video (26), both have caption at inner 7.
-    for f, label in ((3, "image"), (26, "video")):
+    # Media captions — ImageMessage (3) caption at 3, VideoMessage (9) caption at 7.
+    for f, label, caption_field in ((3, "image", 3), (9, "video", 7)):
         if (b := _first_bytes(f)) is not None:
             try:
                 inner = decode_fields(b)
-                cap = inner.get(7, [b""])[0]
+                cap = inner.get(caption_field, [b""])[0]
                 if isinstance(cap, (bytes, bytearray)) and cap:
                     if (s := _utf8(bytes(cap))):
                         return f"[{label}] {s}"
@@ -2164,16 +2197,16 @@ def _extract_text(plaintext: bytes, _depth: int = 0) -> str:
                 pass
             return f"[{label}]"
 
-    # Content types without text — just flag them
-    for f, label in ((23, "audio"), (7, "document"), (25, "sticker")):
+    # Content types without text — just flag them (AudioMessage 8 = voice notes too)
+    for f, label in ((8, "audio"), (7, "document"), (26, "sticker")):
         if _first_bytes(f) is not None:
             return f"[{label}]"
 
-    # Reaction (field 38 = ReactionMessage, inner text at field 2)
-    if (b := _first_bytes(38)) is not None:
+    # Reaction (field 46 = ReactionMessage, inner text at field 1)
+    if (b := _first_bytes(46)) is not None:
         try:
             inner = decode_fields(b)
-            cand = inner.get(2, [None])[0]
+            cand = inner.get(1, [None])[0]
             if isinstance(cand, (bytes, bytearray)) and (s := _utf8(bytes(cand))):
                 return f"[reaction] {s}"
         except Exception:
@@ -2181,9 +2214,9 @@ def _extract_text(plaintext: bytes, _depth: int = 0) -> str:
 
     # Wrappers that nest another Message — recurse into it.
     #   31 = DeviceSentMessage { field 2 = nested Message }
-    #   25 = EphemeralMessage, 24 = ViewOnceMessage, 36 = ViewOnceMessageV2,
+    #   40 = EphemeralMessage, 37 = ViewOnceMessage, 55 = ViewOnceMessageV2,
     #   53 = DocumentWithCaptionMessage — each has nested Message at field 1.
-    _WRAPPERS = [(31, 2), (25, 1), (24, 1), (36, 1), (53, 1)]
+    _WRAPPERS = [(31, 2), (40, 1), (37, 1), (55, 1), (53, 1)]
     for outer_field, inner_field in _WRAPPERS:
         if (b := _first_bytes(outer_field)) is not None:
             try:
@@ -2331,11 +2364,16 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             5: "locationMessage",
             6: "extendedTextMessage",
             7: "documentMessage",
+            8: "audioMessage",
+            9: "videoMessage",
             12: "protocolMessage",
-            23: "audioMessage",
-            26: "videoMessage",
+            26: "stickerMessage",
             31: "deviceSentMessage",
             35: "messageContextInfo",
+            37: "viewOnceMessage",
+            40: "ephemeralMessage",
+            46: "reactionMessage",
+            55: "viewOnceMessageV2",
         }
 
         # Pull something humans can actually read out of the plaintext.
@@ -2361,7 +2399,14 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             # accumulates the kind of duplicates that `wa migrate` cleans
             # up retroactively.
             from wa.cache import canonical_jid
+            from wa.messages import device_sent_destination
 
+            # A deviceSentMessage is our own phone's copy of a message it
+            # sent: it arrives "from" us, but belongs to the destination chat.
+            destination = device_sent_destination(pt)
+            from_me = bool(destination)
+            if destination:
+                chat_jid = destination
             chat_jid = canonical_jid(chat_jid)
             sender_jid = canonical_jid(sender_jid)
             ts_attr = node.attrs.get("t", 0)
@@ -2376,7 +2421,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
             try:
                 from wa.cache import CachedMessage, append_messages, upsert_chat
 
-                from wa.messages import extract_quoted_id
+                from wa.messages import extract_media, extract_quoted_id
 
                 append_messages([
                     CachedMessage(
@@ -2385,9 +2430,10 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                         sender=sender_jid,
                         sender_name=sender_name,
                         text=pretty,
-                        from_me=False,
+                        from_me=from_me,
                         msg_id=msg_id,
                         quoted_id=extract_quoted_id(pt),
+                        media=extract_media(pt),
                     )
                 ])
                 upsert_chat(chat_jid, last_ts=ts)

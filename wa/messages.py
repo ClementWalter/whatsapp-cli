@@ -103,8 +103,64 @@ def build_document_dsm_plaintext(doc: DocumentInfo, destination_jid: str) -> byt
 _CONTEXT_INFO_FIELD = 17
 # Message sub-messages that may carry a ContextInfo, and the wrappers that
 # nest another Message (same table as ``wa.cli._extract_text``).
-_CONTENT_WITH_CONTEXT = (6, 3, 26, 7, 23)
-_WRAPPERS = ((31, 2), (25, 1), (24, 1), (36, 1), (53, 1))
+_CONTENT_WITH_CONTEXT = (6, 3, 9, 7, 8, 26)
+_WRAPPERS = ((31, 2), (40, 1), (37, 1), (55, 1), (53, 1))
+
+# Field numbers of the download-relevant attributes per media sub-message
+# (waE2E.proto): url, mimetype, fileSha256, fileLength, mediaKey,
+# fileEncSha256, directPath, plus `seconds` for audio/video.
+_MEDIA_LAYOUT = {
+    8: ("audio", {"url": 1, "mimetype": 2, "file_sha256": 3, "file_length": 4, "seconds": 5, "ptt": 6, "media_key": 7, "file_enc_sha256": 8, "direct_path": 9}),
+    3: ("image", {"url": 1, "mimetype": 2, "file_sha256": 4, "file_length": 5, "media_key": 8, "file_enc_sha256": 9, "direct_path": 11}),
+    9: ("video", {"url": 1, "mimetype": 2, "file_sha256": 3, "file_length": 4, "seconds": 5, "media_key": 6, "file_enc_sha256": 11, "direct_path": 13}),
+    7: ("document", {"url": 1, "mimetype": 2, "file_sha256": 4, "file_length": 5, "media_key": 7, "file_name": 8, "file_enc_sha256": 9, "direct_path": 10}),
+}
+_BYTES_KEYS = ("media_key", "file_sha256", "file_enc_sha256")
+
+
+def extract_media(plaintext: bytes, _depth: int = 0) -> dict | None:
+    """Return the CDN reference of an audio/image/video/document message, else None.
+
+    Binary keys are base64 so the dict round-trips through the JSONL cache;
+    ``wa download`` turns it back into bytes.
+    """
+    import base64
+
+    from wa.pbutil import decode_fields
+
+    if _depth > 4:
+        return None
+    try:
+        top = decode_fields(plaintext)
+    except Exception:
+        return None
+    for field, (kind, layout) in _MEDIA_LAYOUT.items():
+        if (content := _first_bytes(top, field)) is None:
+            continue
+        try:
+            inner = decode_fields(content)
+        except ValueError:
+            return None
+        ref: dict = {"kind": kind}
+        for name, num in layout.items():
+            values = inner.get(num)
+            if not values:
+                continue
+            value = values[0]
+            if isinstance(value, (bytes, bytearray)):
+                value = base64.b64encode(bytes(value)).decode() if name in _BYTES_KEYS else bytes(value).decode("utf-8", "replace")
+            ref[name] = value
+        return ref if ref.get("media_key") and (ref.get("url") or ref.get("direct_path")) else None
+    for outer, inner_field in _WRAPPERS:
+        if (wrapped := _first_bytes(top, outer)) is None:
+            continue
+        try:
+            nested = _first_bytes(decode_fields(wrapped), inner_field)
+        except ValueError:
+            continue
+        if nested is not None:
+            return extract_media(nested, _depth + 1)
+    return None
 
 
 def _first_bytes(fields: dict, field: int) -> bytes | None:
@@ -160,6 +216,20 @@ class QuotedRef:
         # Cached senders carry the device ("336...:25@s.whatsapp.net"); ContextInfo wants the bare JID.
         user, _, server = sender.partition("@")
         return cls(msg_id=msg_id, participant=f"{user.split(':')[0]}@{server}" if server else sender, text=text)
+
+
+def device_sent_destination(plaintext: bytes) -> str:
+    """For a copy of our own phone's message (deviceSentMessage), the chat it really went to; "" otherwise."""
+    from wa.pbutil import decode_fields
+
+    try:
+        dsm = _first_bytes(decode_fields(plaintext), 31)
+        if dsm is None:
+            return ""
+        dest = _first_bytes(decode_fields(dsm), 1)
+    except ValueError:
+        return ""
+    return dest.decode("utf-8", "replace") if dest else ""
 
 
 def build_reply_plaintext(text: str, quoted_id: str, quoted_participant: str, quoted_text: str) -> bytes:

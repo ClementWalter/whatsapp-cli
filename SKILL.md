@@ -134,9 +134,10 @@ wa read alice --no-extend       # offline, cached only — no network
 wa read alice --json            # machine-readable
 ```
 
-Each `--json` message carries `msg_id` and `quoted_id`: `quoted_id` is the
-`msg_id` of the message a reply quotes (the "reply" bubble on the phone), `""`
-otherwise. Plain output renders a quote as `↩︎ «snippet» text`. That is how a
+Each `--json` message carries `msg_id`, `quoted_id` and `media`: `quoted_id`
+is the `msg_id` of the message a reply quotes (the "reply" bubble on the
+phone), `""` otherwise; `media` is the attachment's CDN reference (kind,
+mimetype, seconds…) consumed by `wa download`, `null` for text. Plain output renders a quote as `↩︎ «snippet» text`. That is how a
 script tells "he answered *this* message" from "he wrote in the same chat".
 
 Auto-extends from the user's phone if the cache is shorter than `--limit`;
@@ -223,6 +224,19 @@ Limitations:
 - Server `<ack>` means "queued for delivery", not "actually delivered".
 - For a brand-new contact (you've never received from them), the CLI
   fetches their prekey bundle automatically — no setup needed.
+
+### `wa download <msg_id> [-o PATH]`
+Download and decrypt an attachment — voice note, image, video or document —
+from a cached message (`media` not null in `wa read --json`, text shown as
+`[audio]`, `[image]`…). Fetched from WhatsApp's CDN with the message's own
+media key, verified and decrypted; prints the written path. Voice notes are
+Ogg/Opus (`.ogg`), which `afconvert` cannot read: decode with libsndfile
+(`soundfile`) or ffmpeg.
+
+```bash
+wa read "Clément Walter" --json | jq '.messages[] | select(.media.kind=="audio") | .msg_id'
+wa download 3A0E8ACA6B24EA044A13 -o /tmp/notes/      # → /tmp/notes/3A0E8ACA6B24EA044A13.ogg
+```
 
 ### `wa import-contacts` (macOS only)
 Pull display names from `Contacts.app` and merge into the local contacts

@@ -50,6 +50,7 @@ class HistoryMessage:
     from_me: bool
     msg_id: str = ""
     quoted_id: str = ""
+    media: dict | None = None
 
 
 def _aes_cbc_decrypt(key: bytes, iv: bytes, ct: bytes) -> bytes:
@@ -246,14 +247,16 @@ def iter_conversation_messages(conv_bytes: bytes) -> Iterable[HistoryMessage]:
 
         text = ""
         quoted_id = ""
+        media = None
         if 2 in wmi and isinstance(wmi[2][0], (bytes, bytearray)):
             # Local import sidesteps a circular import: wa.cli imports from
             # this module, and we need its `_extract_text` helper here.
             from wa.cli import _extract_text
-            from wa.messages import extract_quoted_id
+            from wa.messages import extract_media, extract_quoted_id
 
             text = _extract_text(bytes(wmi[2][0]))
             quoted_id = extract_quoted_id(bytes(wmi[2][0]))
+            media = extract_media(bytes(wmi[2][0]))
 
         yield HistoryMessage(
             chat_jid=chat_id,
@@ -264,4 +267,5 @@ def iter_conversation_messages(conv_bytes: bytes) -> Iterable[HistoryMessage]:
             from_me=from_me,
             msg_id=msg_id,
             quoted_id=quoted_id,
+            media=media,
         )
