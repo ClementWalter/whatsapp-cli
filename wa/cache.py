@@ -6,7 +6,9 @@ Layout under ``~/.cache/whatsapp-cli/store/``:
 - ``contacts.json``  — { jid: push_name }
 - ``messages.jsonl`` — append-only newline-delimited JSON, one message per line:
                        {ts, chat, sender, sender_name, text, from_me, msg_id,
-                        quoted_id} — quoted_id is the msg_id a reply quotes, "" otherwise
+                        quoted_id, media} — quoted_id is the msg_id a reply quotes
+                       ("" otherwise); media is the CDN reference of an attachment
+                       (null otherwise), enough for `wa download`
 
 Two writers (``history`` ingest and live ``login`` decrypt) coexist by
 appending to the JSONL with O_APPEND and rewriting the JSON files
@@ -54,6 +56,8 @@ class CachedMessage:
     from_me: bool
     msg_id: str = ""
     quoted_id: str = ""
+    # CDN reference of an audio/image/video/document (see wa.messages.extract_media), else None.
+    media: dict | None = None
 
 
 def _ensure_dir() -> None:

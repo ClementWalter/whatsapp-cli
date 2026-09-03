@@ -144,6 +144,59 @@ def upload_media(
     raise RuntimeError(f"all media hosts failed: {last_err}")
 
 
+def decrypt_media(media_key: bytes, ciphertext: bytes, media_type: str, file_enc_sha256: bytes | None = None) -> bytes:
+    """Reverse :func:`encrypt_media`: verify the truncated HMAC (and the blob digest), then AES-CBC decrypt."""
+    from wa.history import _aes_cbc_decrypt
+
+    info = MEDIA_HKDF_INFO.get(media_type)
+    if info is None:
+        raise ValueError(f"unknown media type {media_type!r}")
+    if len(ciphertext) <= 10:
+        raise ValueError("media ciphertext too short")
+    expanded = _hkdf_expand(media_key, info, 112)
+    iv, cipher_key, mac_key = expanded[:16], expanded[16:48], expanded[48:80]
+    body, mac = ciphertext[:-10], ciphertext[-10:]
+    if not hmac.compare_digest(hmac.new(mac_key, iv + body, hashlib.sha256).digest()[:10], mac):
+        raise ValueError("media HMAC mismatch")
+    if file_enc_sha256 and hashlib.sha256(ciphertext).digest() != file_enc_sha256:
+        raise ValueError("media fileEncSHA256 mismatch")
+    return _aes_cbc_decrypt(cipher_key, iv, body)
+
+
+def download_media(ref: dict) -> bytes:
+    """Fetch the encrypted blob named by an ``extract_media`` reference and decrypt it."""
+    url = ref.get("url") or f"https://mmg.whatsapp.net{ref['direct_path']}"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Origin": "https://web.whatsapp.com",
+            "Referer": "https://web.whatsapp.com/",
+            "User-Agent": "Mozilla/5.0",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = resp.read()
+    enc_sha = base64.b64decode(ref["file_enc_sha256"]) if ref.get("file_enc_sha256") else None
+    return decrypt_media(base64.b64decode(ref["media_key"]), data, ref["kind"], enc_sha)
+
+
+# Output extension by mimetype; documents keep their own file name.
+MEDIA_EXTENSIONS = {
+    "audio/ogg": ".ogg",
+    "audio/mp4": ".m4a",
+    "audio/mpeg": ".mp3",
+    "image/jpeg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "video/mp4": ".mp4",
+}
+
+
+def media_extension(ref: dict) -> str:
+    base = (ref.get("mimetype") or "").split(";")[0].strip()
+    return MEDIA_EXTENSIONS.get(base, ".bin")
+
+
 def download_and_decrypt_history(ref: MediaRef, host: str = "mmg.whatsapp.net") -> bytes:
     """Fetch an encrypted history blob from the WA CDN and decrypt it.
 
