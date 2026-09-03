@@ -5,7 +5,8 @@ Layout under ``~/.cache/whatsapp-cli/store/``:
 - ``chats.json``     — { jid: {name, last_ts, unread, archived} }
 - ``contacts.json``  — { jid: push_name }
 - ``messages.jsonl`` — append-only newline-delimited JSON, one message per line:
-                       {ts, chat, sender, sender_name, text, from_me, msg_id}
+                       {ts, chat, sender, sender_name, text, from_me, msg_id,
+                        quoted_id} — quoted_id is the msg_id a reply quotes, "" otherwise
 
 Two writers (``history`` ingest and live ``login`` decrypt) coexist by
 appending to the JSONL with O_APPEND and rewriting the JSON files
@@ -52,6 +53,7 @@ class CachedMessage:
     text: str
     from_me: bool
     msg_id: str = ""
+    quoted_id: str = ""
 
 
 def _ensure_dir() -> None:
