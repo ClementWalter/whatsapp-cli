@@ -1,6 +1,6 @@
 ---
 name: whatsapp-cli
-description: "Read and write your own WhatsApp chats from the terminal via the bundled `wa` command. Pairs as a linked device (one-time QR scan); then `wa pull` (alias `sync`) catches up the offline queue, `wa list` (alias `chats`) lists conversations, `wa read <name>` shows a thread, `wa send <peer> \"<text>\"` sends a 1:1 or group message, and `wa send <peer> --doc <path>` shares a document (PDF or any file). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
+description: "Read and write your own WhatsApp chats from the terminal via the bundled `wa` command. Pairs as a linked device (one-time QR scan); then `wa pull` (alias `sync`) catches up the offline queue (or `wa listen` streams live), `wa list` (alias `chats`) lists conversations, `wa read <name>` shows a thread, `wa send <peer> \"<text>\"` sends a 1:1 or group message, and `wa send <peer> --doc <path>` shares a document (PDF or any file). Reads end-to-end-encrypted personal chats — not the Cloud Business API. Use when the user asks to interact with their personal WhatsApp account from a shell or script."
 ---
 
 # WhatsApp User CLI
@@ -105,6 +105,19 @@ wa backfill --minutes 30    # longer, for a big backfill
 
 Reach for it when a chat is visibly missing recent messages. See
 **Recovering missing messages** below for when it can't help.
+
+### `wa listen [--exec CMD]`
+Push instead of pull. Stays connected for hours, decrypts and caches every
+message as it arrives, and prints each one as a JSON line (the `wa read --json`
+shape). With `--exec CMD`, runs CMD per message with that JSON on stdin — the
+inbox heartbeat's trigger. Reconnects with backoff when the server hangs up.
+
+WhatsApp allows one connection per linked device, so while a listener runs:
+`wa pull` is a no-op ("cache is already live"), and `wa send` to a 1:1 chat is
+relayed over `~/.cache/whatsapp-cli/listen.sock` onto the listener's connection
+(~0.7 s instead of a full handshake); group sends are refused until the listener
+stops. `wa read` never needed the socket. Run it under a supervisor (launchd
+KeepAlive, systemd), one per device.
 
 ### `wa list` / `wa chats` `[--limit N] [--json]`
 List the local conversation cache, sorted by most recent activity. Default
