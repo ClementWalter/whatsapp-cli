@@ -38,6 +38,8 @@ if _LEGACY_CACHE_ROOT.exists() and not _CACHE_ROOT.exists():
 
 CACHE_DIR = _CACHE_ROOT / "store"
 LOCK_PATH = _CACHE_ROOT / ".connection.lock"
+# Unix socket a resident `wa listen` serves; `wa send` relays through it, `wa pull` yields to it.
+LISTEN_SOCK = _CACHE_ROOT / "listen.sock"
 MESSAGES_PATH = CACHE_DIR / "messages.jsonl"
 CHATS_PATH = CACHE_DIR / "chats.json"
 CONTACTS_PATH = CACHE_DIR / "contacts.json"

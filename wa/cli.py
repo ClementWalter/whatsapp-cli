@@ -88,6 +88,17 @@ async def _send_presence_available(fs, ns, device: Device) -> None:
 
 
 
+class LiveConnection:
+    """An authenticated socket a resident listener keeps open; sends ride on it."""
+
+    def __init__(self, fs: FrameSocket, ns, session: InboundSession, signal: SignalSession):
+        self.fs, self.ns, self.session, self.signal = fs, ns, session, signal
+
+
+# Called with each CachedMessage the live decrypt path stores; `wa listen` sets it.
+MESSAGE_HOOK = None
+
+
 def _open_inbound(
     fs: FrameSocket,
     ns,
@@ -827,6 +838,9 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
     if dev is None or not dev.is_paired():
         click.echo("not paired — run `login` first", err=True)
         raise SystemExit(1)
+    if _daemon_alive():
+        click.echo("a `wa listen` process holds the connection: the cache is already live, nothing to pull")
+        return
     from wa.cache import connection_lock
 
     with connection_lock():
@@ -901,6 +915,158 @@ def history(minutes: float) -> None:
 
 
 cli.add_command(history, "history")
+
+
+# --- resident listener ---------------------------------------------------------
+#
+# WhatsApp only delivers while a socket is open, and allows one socket per
+# linked device. `wa listen` holds that socket for hours: every message is
+# decrypted, cached and handed to a hook (JSON on stdout, or a command), and a
+# local unix socket lets `wa send` ride on the same connection instead of
+# failing on the lock. `wa pull` becomes a no-op while the listener runs.
+
+def _daemon_request(payload: dict, timeout: float = 90.0) -> dict | None:
+    """Send one JSON request to a running listener; None when no listener answers."""
+    import socket as _socket
+
+    from wa.cache import LISTEN_SOCK
+
+    if not LISTEN_SOCK.exists():
+        return None
+    try:
+        with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sock:
+            sock.settimeout(timeout)
+            sock.connect(str(LISTEN_SOCK))
+            sock.sendall((json.dumps(payload) + "\n").encode())
+            data = b""
+            while not data.endswith(b"\n"):
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                data += chunk
+    except (OSError, ConnectionError):
+        return None
+    return json.loads(data) if data.strip() else None
+
+
+def _daemon_alive() -> bool:
+    return _daemon_request({"op": "ping"}, timeout=3.0) is not None
+
+
+async def _listen_once(device: Device) -> None:
+    """One connection: authenticate, serve sends on the unix socket, drain until the server hangs up."""
+    from wa.cache import LISTEN_SOCK
+    from wa.messages import QuotedRef
+
+    async with FrameSocket() as fs:
+        await fs.connect()
+        ns = await do_handshake(fs, device, build_login_payload(device))
+        while True:
+            ct = await fs.recv(timeout=15.0)
+            node = decode_node(ns.decrypt_frame(ct))
+            if node.tag == "success":
+                break
+            if node.tag == "failure":
+                raise SystemExit(f"login rejected: {_pretty(node)}")
+        session, signal = _open_inbound(fs, ns, device)
+        conn = LiveConnection(fs, ns, session, signal)
+
+        async def handle(reader, writer):
+            try:
+                raw = await asyncio.wait_for(reader.readline(), timeout=30)
+                req = json.loads(raw or b"{}")
+                if req.get("op") == "ping":
+                    reply = {"ok": True, "pid": os.getpid()}
+                elif req.get("op") == "send":
+                    if req["peer_jid"].endswith("@g.us"):
+                        reply = {"ok": False, "error": "group sends are not supported while `wa listen` runs"}
+                    else:
+                        ref = QuotedRef(**req["reply"]) if req.get("reply") else None
+                        try:
+                            msg_id = await _send_async(device, req["peer_jid"], req.get("text", ""), req.get("doc"), req.get("make_thumb", True), ref, conn=conn)
+                            reply = {"ok": bool(msg_id), "msg_id": msg_id}
+                        except SystemExit as e:  # the send path exits on hard errors; the daemon must not
+                            reply = {"ok": False, "error": str(e) or "send failed"}
+                else:
+                    reply = {"ok": False, "error": f"unknown op {req.get('op')!r}"}
+            except Exception as e:
+                reply = {"ok": False, "error": str(e)}
+            writer.write((json.dumps(reply) + "\n").encode())
+            await writer.drain()
+            writer.close()
+
+        if LISTEN_SOCK.exists():
+            LISTEN_SOCK.unlink()
+        server = await asyncio.start_unix_server(handle, path=str(LISTEN_SOCK))
+        try:
+            if not device.prekeys_uploaded:
+                await _upload_prekeys(session, device)
+            active = Node(tag="iq", attrs={"to": JID(server="s.whatsapp.net"), "type": "set", "id": "listen-active", "xmlns": "passive"}, content=[Node(tag="active")])
+            try:
+                await session.request_iq(active, timeout=5.0)
+            except (asyncio.TimeoutError, ConnectionError):
+                pass
+            await _send_presence_available(fs, ns, device)
+            click.echo(click.style("listening — messages stream as JSON lines; `wa send` rides on this connection", fg="green"), err=True)
+            await session.drain(seconds=float("inf"), idle=float("inf"))
+        finally:
+            server.close()
+            if LISTEN_SOCK.exists():
+                LISTEN_SOCK.unlink()
+            await session.stop()
+
+
+async def _listen_async(device: Device, exec_cmd: str | None) -> None:
+    import subprocess as _sp
+    from dataclasses import asdict
+
+    global MESSAGE_HOOK
+
+    def hook(m: CachedMessage) -> None:
+        line = json.dumps(asdict(m), ensure_ascii=False)
+        click.echo(line)
+        sys.stdout.flush()
+        if exec_cmd:
+            proc = _sp.Popen(exec_cmd, shell=True, stdin=_sp.PIPE, text=True)
+            proc.stdin.write(line + "\n")
+            proc.stdin.close()
+
+    MESSAGE_HOOK = hook
+    backoff = 5.0
+    while True:
+        started = asyncio.get_event_loop().time()
+        try:
+            await _listen_once(device)
+        except (ConnectionError, OSError, asyncio.TimeoutError) as e:
+            log.warning("listener connection lost: %s", e)
+        if asyncio.get_event_loop().time() - started > 600:
+            backoff = 5.0  # a long, healthy connection resets the backoff
+        log.info("reconnecting in %.0fs", backoff)
+        await asyncio.sleep(backoff)
+        backoff = min(backoff * 2, 300.0)
+
+
+@cli.command()
+@click.option("--exec", "exec_cmd", default=None, help="Shell command run for each received message, its JSON on stdin (e.g. an inbox trigger).")
+def listen(exec_cmd: str | None) -> None:
+    """Stay connected and stream every received message as a JSON line, reconnecting when dropped.
+
+    Push instead of `wa pull`: the server delivers while the socket is open.
+    Holds the device's single connection, so `wa pull` is a no-op meanwhile and
+    `wa send` is relayed over a local socket onto this connection (1:1 chats;
+    groups are refused while listening). Runs until interrupted.
+    """
+    dev = Device.load()
+    if dev is None or not dev.is_paired():
+        click.echo("not paired — run `login` first", err=True)
+        raise SystemExit(1)
+    from wa.cache import connection_lock
+
+    with connection_lock():
+        try:
+            asyncio.run(_listen_async(dev, exec_cmd))
+        except KeyboardInterrupt:
+            pass
 
 
 @cli.command()
@@ -989,6 +1155,16 @@ def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool, reply_t
 
     reply = _resolve_reply(reply_to, peer_jid) if reply_to else None
     make_thumb = not no_thumbnail
+    if not peer_jid.endswith("@g.us") and _daemon_alive():
+        from dataclasses import asdict as _asdict
+
+        answer = _daemon_request({"op": "send", "peer_jid": peer_jid, "text": text, "doc": doc_path, "make_thumb": make_thumb,
+                                  "reply": _asdict(reply) if reply else None})
+        if answer and answer.get("ok"):
+            click.echo(click.style(f"sent: {answer['msg_id']}", fg="green"))
+            return
+        click.echo(click.style(f"listener refused the send: {(answer or {}).get('error', 'no answer')}", fg="red"), err=True)
+        raise SystemExit(1)
     with connection_lock():
         if peer_jid.endswith("@g.us"):
             asyncio.run(_send_group_async(dev, peer_jid, text, doc_path, make_thumb, reply))
@@ -1404,6 +1580,7 @@ async def _send_async(
     doc_path: str | None = None,
     make_thumb: bool = True,
     reply: "QuotedRef | None" = None,
+    conn: "LiveConnection | None" = None,
 ) -> None:
     """Single-shot send: login, usync devices, encrypt per device, transmit, ack.
 
@@ -1500,6 +1677,247 @@ async def _send_async(
         msg_plaintext = _build_message_plaintext(text)
         dsm_plaintext = _build_dsm_plaintext(text, dsm_dest)
 
+    async def _transmit(session, signal, fs, ns) -> str | None:
+        """Encrypt for every device and send on an authenticated session (fresh or a listener's)."""
+        nonlocal msg_plaintext, dsm_plaintext, cache_text  # the document branch reassigns them
+        active = Node(
+            tag="iq",
+            attrs={
+                "to": JID(server="s.whatsapp.net"),
+                "type": "set",
+                "id": "send-active",
+                "xmlns": "passive",
+            },
+            content=[Node(tag="active")],
+        )
+        try:
+            await session.request_iq(active, timeout=5.0)
+        except (asyncio.TimeoutError, ConnectionError):
+            log.debug("active IQ unconfirmed")
+        await _send_presence_available(fs, ns, device)
+
+        if doc_path:
+            # Encrypt + upload the file now that the socket is authenticated,
+            # then build the document plaintext for the per-device loop below.
+            msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
+                session, doc_path, text or None, dsm_dest, make_thumb
+            )
+
+        # For self-sends we query usync with our LID JID so the response
+        # is a list of LID-form devices — matching the LID-addressed
+        # stanza we'll build below. For peer sends, query PN.
+        if is_self_send and own_lid is not None:
+            queried = [JID(user=own_lid.user, server="lid")]
+        else:
+            queried = [peer_pn_jid]
+            if peer_pn_jid.user != own_pn.user:
+                queried.append(JID(user=own_pn.user, server="s.whatsapp.net"))
+        try:
+            all_devices = await _usync_devices(session, queried)
+        except Exception as e:
+            click.echo(click.style(f"device list query failed: {e}", fg="red"), err=True)
+            raise SystemExit(1)
+        if not all_devices:
+            click.echo(
+                click.style(
+                    "no devices returned — peer may have no WhatsApp account",
+                    fg="red",
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
+        log.info("device list (PN form): %s", [str(d) for d in all_devices])
+
+        # Probe each device for an existing session; for any device that
+        # has none, fetch a prekey bundle so the first encrypt becomes a
+        # pkmsg via X3DH instead of failing with "session not found".
+        no_session_devices: list[JID] = []
+        for dev in all_devices:
+            is_own = (
+                (is_self_send and own_lid is not None and dev.user == own_lid.user)
+                or (not is_self_send and dev.user == own_pn.user)
+            )
+            if is_own and dev.device == own_self_device:
+                continue
+            if is_self_send:
+                enc_user = dev.user
+            elif is_own and own_lid is not None:
+                enc_user = own_lid.user
+            elif (not is_own) and peer_lid_user is not None:
+                enc_user = peer_lid_user
+            else:
+                enc_user = dev.user
+            if not signal.has_session(enc_user, dev.device):
+                no_session_devices.append(dev)
+        if no_session_devices:
+            log.info(
+                "fetching prekey bundles for %d device(s) with no session",
+                len(no_session_devices),
+            )
+            try:
+                bundles = await _fetch_prekey_bundles(session, no_session_devices)
+            except Exception as e:
+                log.warning("prekey fetch failed: %s — some devices will be skipped", e)
+                bundles = {}
+            for dev in no_session_devices:
+                bundle = bundles.get(dev.ad_string())
+                if bundle is None:
+                    log.debug("no bundle returned for %s", dev)
+                    continue
+                # Use the same encryption-identity rules as below.
+                is_own = (
+                    (is_self_send and own_lid is not None and dev.user == own_lid.user)
+                    or (not is_self_send and dev.user == own_pn.user)
+                )
+                if is_self_send:
+                    enc_user = dev.user
+                elif is_own and own_lid is not None:
+                    enc_user = own_lid.user
+                elif (not is_own) and peer_lid_user is not None:
+                    enc_user = peer_lid_user
+                else:
+                    enc_user = dev.user
+                try:
+                    signal.install_prekey_bundle(enc_user, dev.device, **bundle)
+                    log.debug("installed bundle for %s:%d", enc_user, dev.device)
+                except Exception as e:
+                    log.warning(
+                        "couldn't install bundle for %s:%d: %s",
+                        enc_user, dev.device, e,
+                    )
+
+        participant_children: list[Node] = []
+        missing_sessions: list[str] = []
+        any_pkmsg = False
+        for dev in all_devices:
+            # "Own device" check: depends on which namespace we queried.
+            # For self-sends we queried LID, so all devices have user ==
+            # own_lid.user. For peer sends we queried PN.
+            if is_self_send:
+                is_own = own_lid is not None and dev.user == own_lid.user
+            else:
+                is_own = dev.user == own_pn.user
+            if is_own and dev.device == own_self_device:
+                continue
+            plaintext = dsm_plaintext if is_own else msg_plaintext
+            padded = pad_for_signal(plaintext)
+            # Encryption identity. For self-sends the device list IS
+            # already LID, so encrypt under dev.user directly. For peer
+            # sends, dev.user is PN; translate to the peer's LID local
+            # part (which is where active sessions are stored).
+            if is_self_send:
+                enc_user = dev.user
+            elif is_own and own_lid is not None:
+                enc_user = own_lid.user
+            elif (not is_own) and peer_lid_user is not None:
+                enc_user = peer_lid_user
+            else:
+                enc_user = dev.user
+            try:
+                ct, kind = signal.encrypt_msg(enc_user, dev.device, padded)
+            except Exception as e:
+                missing_sessions.append(f"{enc_user}:{dev.device}")
+                log.debug("no session with %s:%d (%s)", enc_user, dev.device, e)
+                continue
+            if kind == "pkmsg":
+                any_pkmsg = True
+            # Wire identity matches what we'll address the stanza with:
+            # LID for self-sends, PN for peer sends. Media messages carry a
+            # `mediatype` on every <enc> so the recipient treats the
+            # decrypted payload as media (whatsmeow sets this whenever the
+            # message has a media type — without it documents don't render).
+            enc_attrs = {"v": "2", "type": kind}
+            if doc_path:
+                enc_attrs["mediatype"] = "document"
+            participant_children.append(
+                Node(
+                    tag="to",
+                    attrs={"jid": dev},
+                    content=[Node(tag="enc", attrs=enc_attrs, content=ct)],
+                )
+            )
+        if not participant_children:
+            click.echo(
+                click.style(
+                    "no encryptable devices — every target lacked a Signal session.\n"
+                    "  hint: receive any message from the peer first (so their session "
+                    "is bootstrapped), then retry. Pre-key bundle fetch for "
+                    "first-contact sends is not yet implemented.",
+                    fg="red",
+                ),
+                err=True,
+            )
+            raise SystemExit(1)
+        if missing_sessions:
+            log.warning(
+                "skipped %d device(s) with no session: %s",
+                len(missing_sessions), ", ".join(missing_sessions),
+            )
+
+        # The participant-list hash (`phash`) is computed for diagnostics
+        # but deliberately NOT placed on the DM stanza — whatsmeow only
+        # puts it on group sends, and including it on DMs makes the
+        # server quietly drop the message. Same for `addressing_mode`,
+        # which is a group-specific attribute.
+        msg_id = "3EB0" + secrets.token_hex(9).upper()
+        content_nodes: list[Node] = [
+            Node(tag="participants", content=participant_children)
+        ]
+        if any_pkmsg and device.account:
+            # When any per-device `<enc>` was a pkmsg (first message in
+            # that session direction), the recipient needs our signed
+            # ADV identity to verify the prekey signal message. The blob
+            # is `ADVSignedDeviceIdentity`, captured during pairing.
+            content_nodes.append(
+                Node(tag="device-identity", content=device.account)
+            )
+        stanza = Node(
+            tag="message",
+            attrs={"to": wire_to, "type": stanza_type, "id": msg_id},
+            content=content_nodes,
+        )
+        await session.send_node(stanza)
+        log.info(
+            "sent %s id=%s to=%s participants=%d any_pkmsg=%s",
+            stanza_type, msg_id, wire_to, len(participant_children), any_pkmsg,
+        )
+
+        try:
+            await session.wait_ack(msg_id, timeout=15.0)
+        except (asyncio.TimeoutError, ConnectionError):
+            click.echo(
+                click.style(
+                    "no ack within 15s — message may or may not have been queued",
+                    fg="yellow",
+                ),
+                err=True,
+            )
+            return
+        # Canonicalize before persisting: a user-typed peer JID
+        # may be in PN form even when canonical form is @lid.
+        from wa.cache import canonical_jid
+
+        cache_jid = canonical_jid(peer_jid)
+        ts = int(_time.time())
+        append_messages([
+            CachedMessage(
+                ts=ts,
+                chat=cache_jid,
+                sender=str(own_pn) if own_pn.user else "",
+                sender_name="me",
+                text=cache_text,
+                from_me=True,
+                msg_id=msg_id,
+                quoted_id=reply.msg_id if reply else "",
+            )
+        ])
+        upsert_chat(cache_jid, last_ts=ts)
+        click.echo(click.style(f"sent: {msg_id}", fg="green"))
+        return msg_id
+
+    if conn is not None:
+        # A resident `wa listen` owns the socket: send on its session instead of opening a second one.
+        return await _transmit(conn.session, conn.signal, conn.fs, conn.ns)
     async with FrameSocket() as fs:
         await fs.connect()
         try:
@@ -1525,239 +1943,7 @@ async def _send_async(
 
         session, signal = _open_inbound(fs, ns, device)
         try:
-            active = Node(
-                tag="iq",
-                attrs={
-                    "to": JID(server="s.whatsapp.net"),
-                    "type": "set",
-                    "id": "send-active",
-                    "xmlns": "passive",
-                },
-                content=[Node(tag="active")],
-            )
-            try:
-                await session.request_iq(active, timeout=5.0)
-            except (asyncio.TimeoutError, ConnectionError):
-                log.debug("active IQ unconfirmed")
-            await _send_presence_available(fs, ns, device)
-
-            if doc_path:
-                # Encrypt + upload the file now that the socket is authenticated,
-                # then build the document plaintext for the per-device loop below.
-                msg_plaintext, dsm_plaintext, cache_text = await _prepare_document(
-                    session, doc_path, text or None, dsm_dest, make_thumb
-                )
-
-            # For self-sends we query usync with our LID JID so the response
-            # is a list of LID-form devices — matching the LID-addressed
-            # stanza we'll build below. For peer sends, query PN.
-            if is_self_send and own_lid is not None:
-                queried = [JID(user=own_lid.user, server="lid")]
-            else:
-                queried = [peer_pn_jid]
-                if peer_pn_jid.user != own_pn.user:
-                    queried.append(JID(user=own_pn.user, server="s.whatsapp.net"))
-            try:
-                all_devices = await _usync_devices(session, queried)
-            except Exception as e:
-                click.echo(click.style(f"device list query failed: {e}", fg="red"), err=True)
-                raise SystemExit(1)
-            if not all_devices:
-                click.echo(
-                    click.style(
-                        "no devices returned — peer may have no WhatsApp account",
-                        fg="red",
-                    ),
-                    err=True,
-                )
-                raise SystemExit(1)
-            log.info("device list (PN form): %s", [str(d) for d in all_devices])
-
-            # Probe each device for an existing session; for any device that
-            # has none, fetch a prekey bundle so the first encrypt becomes a
-            # pkmsg via X3DH instead of failing with "session not found".
-            no_session_devices: list[JID] = []
-            for dev in all_devices:
-                is_own = (
-                    (is_self_send and own_lid is not None and dev.user == own_lid.user)
-                    or (not is_self_send and dev.user == own_pn.user)
-                )
-                if is_own and dev.device == own_self_device:
-                    continue
-                if is_self_send:
-                    enc_user = dev.user
-                elif is_own and own_lid is not None:
-                    enc_user = own_lid.user
-                elif (not is_own) and peer_lid_user is not None:
-                    enc_user = peer_lid_user
-                else:
-                    enc_user = dev.user
-                if not signal.has_session(enc_user, dev.device):
-                    no_session_devices.append(dev)
-            if no_session_devices:
-                log.info(
-                    "fetching prekey bundles for %d device(s) with no session",
-                    len(no_session_devices),
-                )
-                try:
-                    bundles = await _fetch_prekey_bundles(session, no_session_devices)
-                except Exception as e:
-                    log.warning("prekey fetch failed: %s — some devices will be skipped", e)
-                    bundles = {}
-                for dev in no_session_devices:
-                    bundle = bundles.get(dev.ad_string())
-                    if bundle is None:
-                        log.debug("no bundle returned for %s", dev)
-                        continue
-                    # Use the same encryption-identity rules as below.
-                    is_own = (
-                        (is_self_send and own_lid is not None and dev.user == own_lid.user)
-                        or (not is_self_send and dev.user == own_pn.user)
-                    )
-                    if is_self_send:
-                        enc_user = dev.user
-                    elif is_own and own_lid is not None:
-                        enc_user = own_lid.user
-                    elif (not is_own) and peer_lid_user is not None:
-                        enc_user = peer_lid_user
-                    else:
-                        enc_user = dev.user
-                    try:
-                        signal.install_prekey_bundle(enc_user, dev.device, **bundle)
-                        log.debug("installed bundle for %s:%d", enc_user, dev.device)
-                    except Exception as e:
-                        log.warning(
-                            "couldn't install bundle for %s:%d: %s",
-                            enc_user, dev.device, e,
-                        )
-
-            participant_children: list[Node] = []
-            missing_sessions: list[str] = []
-            any_pkmsg = False
-            for dev in all_devices:
-                # "Own device" check: depends on which namespace we queried.
-                # For self-sends we queried LID, so all devices have user ==
-                # own_lid.user. For peer sends we queried PN.
-                if is_self_send:
-                    is_own = own_lid is not None and dev.user == own_lid.user
-                else:
-                    is_own = dev.user == own_pn.user
-                if is_own and dev.device == own_self_device:
-                    continue
-                plaintext = dsm_plaintext if is_own else msg_plaintext
-                padded = pad_for_signal(plaintext)
-                # Encryption identity. For self-sends the device list IS
-                # already LID, so encrypt under dev.user directly. For peer
-                # sends, dev.user is PN; translate to the peer's LID local
-                # part (which is where active sessions are stored).
-                if is_self_send:
-                    enc_user = dev.user
-                elif is_own and own_lid is not None:
-                    enc_user = own_lid.user
-                elif (not is_own) and peer_lid_user is not None:
-                    enc_user = peer_lid_user
-                else:
-                    enc_user = dev.user
-                try:
-                    ct, kind = signal.encrypt_msg(enc_user, dev.device, padded)
-                except Exception as e:
-                    missing_sessions.append(f"{enc_user}:{dev.device}")
-                    log.debug("no session with %s:%d (%s)", enc_user, dev.device, e)
-                    continue
-                if kind == "pkmsg":
-                    any_pkmsg = True
-                # Wire identity matches what we'll address the stanza with:
-                # LID for self-sends, PN for peer sends. Media messages carry a
-                # `mediatype` on every <enc> so the recipient treats the
-                # decrypted payload as media (whatsmeow sets this whenever the
-                # message has a media type — without it documents don't render).
-                enc_attrs = {"v": "2", "type": kind}
-                if doc_path:
-                    enc_attrs["mediatype"] = "document"
-                participant_children.append(
-                    Node(
-                        tag="to",
-                        attrs={"jid": dev},
-                        content=[Node(tag="enc", attrs=enc_attrs, content=ct)],
-                    )
-                )
-            if not participant_children:
-                click.echo(
-                    click.style(
-                        "no encryptable devices — every target lacked a Signal session.\n"
-                        "  hint: receive any message from the peer first (so their session "
-                        "is bootstrapped), then retry. Pre-key bundle fetch for "
-                        "first-contact sends is not yet implemented.",
-                        fg="red",
-                    ),
-                    err=True,
-                )
-                raise SystemExit(1)
-            if missing_sessions:
-                log.warning(
-                    "skipped %d device(s) with no session: %s",
-                    len(missing_sessions), ", ".join(missing_sessions),
-                )
-
-            # The participant-list hash (`phash`) is computed for diagnostics
-            # but deliberately NOT placed on the DM stanza — whatsmeow only
-            # puts it on group sends, and including it on DMs makes the
-            # server quietly drop the message. Same for `addressing_mode`,
-            # which is a group-specific attribute.
-            msg_id = "3EB0" + secrets.token_hex(9).upper()
-            content_nodes: list[Node] = [
-                Node(tag="participants", content=participant_children)
-            ]
-            if any_pkmsg and device.account:
-                # When any per-device `<enc>` was a pkmsg (first message in
-                # that session direction), the recipient needs our signed
-                # ADV identity to verify the prekey signal message. The blob
-                # is `ADVSignedDeviceIdentity`, captured during pairing.
-                content_nodes.append(
-                    Node(tag="device-identity", content=device.account)
-                )
-            stanza = Node(
-                tag="message",
-                attrs={"to": wire_to, "type": stanza_type, "id": msg_id},
-                content=content_nodes,
-            )
-            await session.send_node(stanza)
-            log.info(
-                "sent %s id=%s to=%s participants=%d any_pkmsg=%s",
-                stanza_type, msg_id, wire_to, len(participant_children), any_pkmsg,
-            )
-
-            try:
-                await session.wait_ack(msg_id, timeout=15.0)
-            except (asyncio.TimeoutError, ConnectionError):
-                click.echo(
-                    click.style(
-                        "no ack within 15s — message may or may not have been queued",
-                        fg="yellow",
-                    ),
-                    err=True,
-                )
-                return
-            # Canonicalize before persisting: a user-typed peer JID
-            # may be in PN form even when canonical form is @lid.
-            from wa.cache import canonical_jid
-
-            cache_jid = canonical_jid(peer_jid)
-            ts = int(_time.time())
-            append_messages([
-                CachedMessage(
-                    ts=ts,
-                    chat=cache_jid,
-                    sender=str(own_pn) if own_pn.user else "",
-                    sender_name="me",
-                    text=cache_text,
-                    from_me=True,
-                    msg_id=msg_id,
-                    quoted_id=reply.msg_id if reply else "",
-                )
-            ])
-            upsert_chat(cache_jid, last_ts=ts)
-            click.echo(click.style(f"sent: {msg_id}", fg="green"))
+            return await _transmit(session, signal, fs, ns)
         finally:
             await session.stop()
 
@@ -2423,20 +2609,24 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
 
                 from wa.messages import extract_media, extract_quoted_id
 
-                append_messages([
-                    CachedMessage(
-                        ts=ts,
-                        chat=chat_jid,
-                        sender=sender_jid,
-                        sender_name=sender_name,
-                        text=pretty,
-                        from_me=from_me,
-                        msg_id=msg_id,
-                        quoted_id=extract_quoted_id(pt),
-                        media=extract_media(pt),
-                    )
-                ])
+                cached = CachedMessage(
+                    ts=ts,
+                    chat=chat_jid,
+                    sender=sender_jid,
+                    sender_name=sender_name,
+                    text=pretty,
+                    from_me=from_me,
+                    msg_id=msg_id,
+                    quoted_id=extract_quoted_id(pt),
+                    media=extract_media(pt),
+                )
+                append_messages([cached])
                 upsert_chat(chat_jid, last_ts=ts)
+                if MESSAGE_HOOK is not None:
+                    try:
+                        MESSAGE_HOOK(cached)
+                    except Exception as e:  # a hook must never take the socket down
+                        log.warning("message hook failed: %s", e)
             except Exception as e:
                 log.warning("cache append failed: %s", e)
             click.echo(
