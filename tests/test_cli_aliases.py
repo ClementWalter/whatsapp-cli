@@ -29,6 +29,8 @@ def handshake_kwargs(monkeypatch):
     monkeypatch.setattr(cli, "_login_handshake", _fake_handshake)
     monkeypatch.setattr(cache, "connection_lock", contextlib.nullcontext)
     monkeypatch.setattr(cache, "iter_messages", lambda: iter(()))
+    # A developer's resident listener must not bypass the test handshake.
+    monkeypatch.setattr(cli, "_daemon_alive", lambda: False)
     return captured
 
 
