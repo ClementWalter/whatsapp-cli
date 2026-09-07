@@ -3245,5 +3245,26 @@ async def _login_handshake(
             )
 
 
+@cli.command("auth-status")
+@click.option("--json", "as_json", is_flag=True, help="Emit secret-free metadata.")
+def auth_status(as_json):
+    """Inspect this host's pairing. Example: auth-status --json."""
+    device = Device.load()
+    paired = bool(device and device.is_paired())
+    click.echo(json.dumps({
+        "connector": "whatsapp", "account": "default", "source": "host-local",
+        "configured": paired, "pending": False, "last_sync": None,
+        "session_scope": "host", "pairing_required": not paired,
+        "portable": False,
+    }))
+
+
+@cli.command("auth-sync")
+def auth_sync():
+    """Report device-local storage without cloning keys. Example: auth-sync."""
+    click.echo(json.dumps({"connector": "whatsapp", "source": "host-local", "portable": False,
+                          "reason": "Each host requires independent device pairing; active keys cannot be synchronized."}))
+
+
 if __name__ == "__main__":
     cli()
