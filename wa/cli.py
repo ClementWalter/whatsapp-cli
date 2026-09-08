@@ -3266,5 +3266,9 @@ def auth_sync():
                           "reason": "Each host requires independent device pairing; active keys cannot be synchronized."}))
 
 
+# Provider commands share the same execution policy as the app and MCP.
+from .onebrain_policy import install as _install_onebrain_policy
+_install_onebrain_policy(cli, 'whatsapp')
+
 if __name__ == "__main__":
     cli()
