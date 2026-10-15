@@ -1,5 +1,48 @@
 # whatsapp-cli
 
+A separate `signal-cli` command supports Signal alongside `wa`. Signal and
+WhatsApp share encryption concepts, but use different services and transports.
+Signal connectivity uses the maintained [AsamK/signal-cli](https://github.com/AsamK/signal-cli)
+backend rather than WhatsApp's protocol implementation.
+
+## Signal
+
+Install the upstream backend first (on macOS, `brew install signal-cli`). The
+checkout launcher is `./bin/signal-cli`; installing this package also exposes
+`signal-cli` on PATH. The wrapper skips its own executable when locating the
+upstream backend. Set `SIGNAL_CLI_BACKEND` to the upstream executable if it is
+not on PATH.
+
+```bash
+./bin/signal-cli login                 # scan QR: Signal > Settings > Linked devices
+./bin/signal-cli status --json
+./bin/signal-cli pull                  # receive queued text
+./bin/signal-cli list --json           # known contacts and groups
+./bin/signal-cli read Alice --json     # locally received text
+./bin/signal-cli send Alice hello      # preview only
+./bin/signal-cli send Alice hello --yes
+```
+
+`send` also accepts `--doc FILE` and `--stdin`. Names must resolve uniquely;
+exact phone numbers, UUIDs, `u:` usernames, and known group IDs are supported.
+`sync` aliases `pull`; `chats` aliases `list`. Use `--account NUMBER_OR_ACI`
+(or `SIGNAL_ACCOUNT`) when multiple accounts are linked. `--data-dir PATH`
+selects an independent backend store and inbox.
+
+The default data directory is `$XDG_DATA_HOME/signal-cli`, falling back to
+`~/.local/share/signal-cli`. Native credentials stay in the upstream store;
+received text is cached in `inbox.sqlite3` in that directory, scoped by account.
+`pull` sends the backend's normal delivery receipts, without requesting read
+receipts. It does not download attachments. The local inbox excludes
+disappearing and view-once messages. It contains text received by this linked
+device, including sent-message syncs from other devices; it does not import
+old phone history or record sends made through this wrapper. Edits, reactions,
+and stories are not presented. `list` shows known contacts/groups rather than
+ordering an inbox by recent activity. Keep the upstream backend updated as
+Signal changes its service.
+
+## WhatsApp
+
 A pure-Python WhatsApp client that pairs as a **linked device** and gives you
 your own chats from the terminal:
 

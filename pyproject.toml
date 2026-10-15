@@ -22,6 +22,7 @@ macos = ["pyobjc-framework-Contacts==12.1"]
 
 [project.scripts]
 wa = "wa.cli:cli"
+signal-cli = "wa.signal_cli:cli"
 
 [dependency-groups]
 test = [

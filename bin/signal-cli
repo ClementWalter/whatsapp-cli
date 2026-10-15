@@ -1,0 +1,17 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = ["click==8.3.3"]
+# ///
+"""Launch the Signal companion CLI from a checkout without installation."""
+
+import sys
+from pathlib import Path
+
+# Checkout launchers need the sibling package on the import path.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from wa.signal_cli import cli
+
+if __name__ == "__main__":
+    cli()
