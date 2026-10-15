@@ -15,6 +15,7 @@ from pathlib import Path
 
 # Unknown commands are writes until their read behavior has been reviewed.
 READS = {
+    "signal": {"status", "list", "chats", "read", "pull", "sync"},
     "whatsapp": {"status", "list", "chats", "read", "download", "pull", "sync", "listen"},
     "telegram": {"whoami", "chats", "read", "search", "download", "folders", "folder", "listen"},
     "email": {"accounts", "mailboxes", "list", "search", "read", "attachments", "auth status"},
