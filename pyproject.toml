@@ -1,7 +1,7 @@
 [project]
 name = "whatsapp-cli"
 version = "0.1.0"
-description = "Pure-Python WhatsApp Web client with CLI; reads personal chats via linked-device pairing."
+description = "Native WhatsApp and Signal CLIs for personal chats via linked-device pairing."
 requires-python = ">=3.11"
 # Exact-pinned to defend against supply-chain attacks: a compromised
 # new release on PyPI can't sneak in via `>=` resolution. `uv.lock`
@@ -36,3 +36,10 @@ test = [
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+
+[tool.setuptools.package-data]
+wa = ["signal_native/*.mjs", "signal_native/*.json", "signal_native/*.md", "signal_native/*.pem", "signal_native/protos/*.proto", "signal_native/protos/LICENSE"]
+
+[tool.setuptools.packages.find]
+include = ["wa*"]
+exclude = ["wa.signal_native.node_modules*", "wa.signal_native.test*"]

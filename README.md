@@ -2,23 +2,26 @@
 
 A separate `signal-cli` command supports Signal alongside `wa`. Signal and
 WhatsApp share encryption concepts, but use different services and transports.
-Signal connectivity uses the maintained [AsamK/signal-cli](https://github.com/AsamK/signal-cli)
-backend rather than WhatsApp's protocol implementation.
+Signal connects directly through the client in `wa/signal_native/`, using
+Signal's official `libsignal` library for cryptography and network connections.
+It does not require a third-party Signal executable or daemon.
 
 ## Signal
 
-Install the upstream backend first (on macOS, `brew install signal-cli`). The
-checkout launcher is `./bin/signal-cli`; installing this package also exposes
-`signal-cli` on PATH. The wrapper skips its own executable when locating the
-upstream backend. Set `SIGNAL_CLI_BACKEND` to the upstream executable if it is
-not on PATH.
+Requires Python 3.11+, uv, and Node.js 24.18.1+ with npm. The checkout launcher
+is `./bin/signal-cli`; installing this package also exposes `signal-cli` on PATH.
+The Python command interface reuses the existing CLI and inbox conventions;
+the repository-owned JavaScript client uses the official native Rust library
+through its Node bindings. `setup` installs exact locked dependencies.
 
 ```bash
-./bin/signal-cli login                 # scan QR: Signal > Settings > Linked devices
+./bin/signal-cli setup
+./bin/signal-cli login                 # scan QR, choose Transfer Message History
 ./bin/signal-cli status --json
 ./bin/signal-cli pull                  # receive queued text
 ./bin/signal-cli list --json           # known contacts and groups
 ./bin/signal-cli read Alice --json     # locally received text
+./bin/signal-cli backfill --json       # retry a pending pairing history import
 ./bin/signal-cli send Alice hello      # preview only
 ./bin/signal-cli send Alice hello --yes
 ```
@@ -27,19 +30,33 @@ not on PATH.
 exact phone numbers, UUIDs, `u:` usernames, and known group IDs are supported.
 `sync` aliases `pull`; `chats` aliases `list`. Use `--account NUMBER_OR_ACI`
 (or `SIGNAL_ACCOUNT`) when multiple accounts are linked. `--data-dir PATH`
-selects an independent backend store and inbox.
+selects an independent account store and inbox. `login --json --qr-file FILE`
+emits machine-readable pairing events and saves a scannable PNG. Use
+`login --no-history` to pair without requesting older messages.
 
 The default data directory is `$XDG_DATA_HOME/signal-cli`, falling back to
-`~/.local/share/signal-cli`. Native credentials stay in the upstream store;
-received text is cached in `inbox.sqlite3` in that directory, scoped by account.
-`pull` sends the backend's normal delivery receipts, without requesting read
-receipts. It does not download attachments. The local inbox excludes
-disappearing and view-once messages. It contains text received by this linked
-device, including sent-message syncs from other devices; it does not import
-old phone history or record sends made through this wrapper. Edits, reactions,
-and stories are not presented. `list` shows known contacts/groups rather than
-ordering an inbox by recent activity. Keep the upstream backend updated as
-Signal changes its service.
+`~/.local/share/signal-cli`. Credentials, ratchets, encrypted receive queues,
+and text history live in the private `inbox.sqlite3`, scoped by account. Native
+commands serialize changes to ratchets. The receiver commits an encrypted copy
+before acknowledging delivery; failed decryption remains queued for retry.
+Receiving does not send read receipts or download incoming attachments.
+The local inbox excludes disappearing and view-once content. Edits, reactions,
+and stories are not presented. Known groups appear before contacts in `list`.
+
+Pairing requests Signal's encrypted history transfer. The phone must approve
+Transfer Message History; the client verifies the archive's HMAC, decrypts it,
+validates the backup frames with libsignal, and imports ordinary text. A
+successful import deletes the ephemeral transfer key. `backfill` retries a
+pending transfer; a device paired without a history key must pair again.
+Native pairing and file-upload compatibility require verification against the
+user's account; offline tests do not prove every live service interaction.
+
+If a previous version used AsamK's client, native startup imports its existing
+credentials, ratchets, contacts, and groups from the local store without
+invoking that executable. Original files are retained. Stop using the old
+client for that linked device after migration: two independent ratchet stores
+for one device would diverge. A new native pairing retains the previous native
+credentials in the private database and preserves the inbox.
 
 ## WhatsApp
 
@@ -151,6 +168,14 @@ Trigger phrases include "send a WhatsApp message", "read my WhatsApp
 chats", "catch me up on WhatsApp".
 
 ## Development
+
+Signal protocol tests use the official library and run without an account:
+
+```bash
+signal-cli setup
+npm test --prefix wa/signal_native
+uv run --group test pytest tests/test_signal_cli.py -q
+```
 
 ```bash
 # One-time: build the Go oracle (used as the byte-for-byte reference for tests).

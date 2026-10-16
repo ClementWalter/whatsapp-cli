@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -12,7 +11,9 @@ import click
 import pytest
 from click.testing import CliRunner
 
-from wa.signal_cli import Client, backend_path, cli
+from wa.signal_cli import NATIVE_ROOT, Client, cli, native_node
+
+NATIVE_RUN = Client.run
 
 
 @pytest.fixture
@@ -52,16 +53,31 @@ def event():
 
 
 @pytest.mark.parametrize(
-    "command", ["login", "status", "list", "chats", "pull", "sync", "read", "send"]
+    "command",
+    [
+        "login",
+        "status",
+        "list",
+        "chats",
+        "pull",
+        "sync",
+        "read",
+        "send",
+        "setup",
+        "backfill",
+        "history",
+    ],
 )
 def test_command_help_has_example(command):
     assert "Example:" in CliRunner().invoke(cli, [command, "--help"]).output
 
 
 def test_native_command_places_global_options_first(client, monkeypatch):
-    monkeypatch.setattr("wa.signal_cli.backend_path", lambda: "native-client")
+    monkeypatch.setattr("wa.signal_cli.native_node", lambda: "node")
     assert client.command("--output", "json", "receive") == [
-        "native-client",
+        "node",
+        "--disable-warning=ExperimentalWarning",
+        str(NATIVE_ROOT / "runtime.mjs"),
         "--data-dir",
         str(client.data_dir),
         "--account",
@@ -73,27 +89,19 @@ def test_native_command_places_global_options_first(client, monkeypatch):
 
 
 def test_link_omits_account(client, monkeypatch):
-    monkeypatch.setattr("wa.signal_cli.backend_path", lambda: "native-client")
+    monkeypatch.setattr("wa.signal_cli.native_node", lambda: "node")
     assert "--account" not in client.command("link", account=False)
 
 
-def test_skip_wrapper_on_path(monkeypatch, tmp_path):
-    wrapper = tmp_path / "wrapper"
-    native = tmp_path / "native"
-    wrapper.mkdir()
-    native.mkdir()
-    (wrapper / "signal-cli").write_text("from wa.signal_cli import cli")
-    (wrapper / "signal-cli").chmod(0o700)
-    (native / "signal-cli").write_text("native executable")
-    (native / "signal-cli").chmod(0o700)
-    monkeypatch.delenv("SIGNAL_CLI_BACKEND", raising=False)
-    monkeypatch.setenv("PATH", os.pathsep.join([str(wrapper), str(native)]))
-    assert backend_path() == str(native / "signal-cli")
+def test_external_backend_setting_is_ignored(monkeypatch):
+    monkeypatch.setenv("SIGNAL_CLI_BACKEND", "/untrusted/backend")
+    monkeypatch.setattr("wa.signal_cli.node_runtime", lambda: "node")
+    assert native_node() == "node"
 
 
-def test_missing_backend_is_actionable(monkeypatch, tmp_path):
-    monkeypatch.setenv("SIGNAL_CLI_BACKEND", str(tmp_path / "missing"))
-    assert "SIGNAL_CLI_BACKEND" in CliRunner().invoke(cli, ["status"]).output
+def test_missing_node_is_actionable(monkeypatch):
+    monkeypatch.setattr("wa.signal_cli.shutil.which", lambda name, **kwargs: None)
+    assert "Node.js" in CliRunner().invoke(cli, ["status"]).output
 
 
 def test_account_without_phone_uses_aci(client, monkeypatch):
@@ -292,6 +300,15 @@ def test_send_preserves_leading_dash(backend):
 
 @pytest.fixture
 def receiver(monkeypatch, backend):
+    stub_run = Client.run
+
+    def dispatch(self, *args, **kwargs):
+        if args[0] == "listAccounts":
+            return stub_run(self, *args, **kwargs)
+        return NATIVE_RUN(self, *args, **kwargs)
+
+    monkeypatch.setattr(Client, "run", dispatch)
+
     def configure(event, *, exit_code=0, trailer=""):
         # A real child exercises the receive stream without contacting Signal.
         output = json.dumps(event) + "\n" + trailer
@@ -303,33 +320,32 @@ def receiver(monkeypatch, backend):
     return configure
 
 
-def test_pull_caches_real_subprocess_stream(client, receiver, event):
+def test_native_subprocess_returns_json(client, receiver, event):
     receiver(event)
-    CliRunner().invoke(cli, ["--data-dir", str(client.data_dir), "pull"])
-    with client.database() as db:
-        assert db.execute("SELECT body FROM messages").fetchone()[0] == "hello"
+    assert client.run("receive") == event
 
 
 def test_pull_reports_received_events(client, receiver, event):
-    receiver(event)
+    receiver({"received_events": 1})
     result = CliRunner().invoke(
         cli, ["--data-dir", str(client.data_dir), "pull", "--json"]
     )
     assert json.loads(result.output) == {"received_events": 1}
 
 
+def test_native_processes_are_serialized(client):
+    with (
+        client.lock(),
+        pytest.raises(click.ClickException, match="Another Signal command"),
+        client.lock(),
+    ):
+        pass
+
+
 @pytest.mark.parametrize("exit_code,trailer", [(1, ""), (0, "invalid-json\n")])
-def test_failed_pull_preserves_committed_messages(
+def test_failed_native_process_returns_error(
     client, receiver, event, exit_code, trailer
 ):
-    receiver(event, exit_code=exit_code, trailer=trailer)
-    CliRunner().invoke(cli, ["--data-dir", str(client.data_dir), "pull"])
-    with client.database() as db:
-        assert db.execute("SELECT body FROM messages").fetchone()[0] == "hello"
-
-
-@pytest.mark.parametrize("exit_code,trailer", [(1, ""), (0, "invalid-json\n")])
-def test_failed_pull_returns_error(client, receiver, event, exit_code, trailer):
     receiver(event, exit_code=exit_code, trailer=trailer)
     result = CliRunner().invoke(cli, ["--data-dir", str(client.data_dir), "pull"])
     assert result.exit_code == 1
@@ -360,11 +376,11 @@ def test_launcher_help_end_to_end():
     assert "WhatsApp-style" in result.stdout
 
 
-def test_native_backend_unpaired_status_end_to_end(tmp_path):
+def test_native_unpaired_status_end_to_end(tmp_path):
     try:
-        native = backend_path()
+        native_node()
     except click.ClickException:
-        pytest.skip("AsamK/signal-cli is not installed")
+        pytest.skip("Official libsignal dependency is not installed")
     result = subprocess.run(
         [
             sys.executable,
@@ -374,7 +390,6 @@ def test_native_backend_unpaired_status_end_to_end(tmp_path):
             "status",
             "--json",
         ],
-        env={**os.environ, "SIGNAL_CLI_BACKEND": native},
         capture_output=True,
         text=True,
         check=True,
