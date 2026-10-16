@@ -1,39 +1,54 @@
-"""Signal linked-device commands backed by AsamK/signal-cli and a local inbox."""
+"""Signal commands using the repository's direct client and official libsignal."""
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import uuid
-from contextlib import closing
+from contextlib import closing, contextmanager
 from pathlib import Path
 
 import click
 
+NATIVE_ROOT = Path(__file__).with_name("signal_native")
 
-def backend_path() -> str:
-    """Find the native client without recursively invoking this wrapper."""
-    explicit = os.environ.get("SIGNAL_CLI_BACKEND")
-    candidates = (
-        [explicit]
-        if explicit
-        else [str(Path(directory) / "signal-cli") for directory in os.get_exec_path()]
-    )
-    for candidate in candidates:
-        path = Path(candidate).expanduser()
-        if not path.is_file() or not os.access(path, os.X_OK):
+
+def node_runtime() -> str:
+    """Select an installed Node version supported by the cryptography library."""
+    checked = set()
+    for directory in os.get_exec_path():
+        node = shutil.which("node", path=directory)
+        if not node or str(Path(node).resolve()) in checked:
             continue
-        # Both the checkout launcher and installed entry point import this module.
-        with path.open("rb") as stream:
-            if b"wa.signal_cli" in stream.read(8192):
-                continue
-        return str(path.resolve())
+        checked.add(str(Path(node).resolve()))
+        result = subprocess.run(
+            [node, "--version"], capture_output=True, text=True, check=False
+        )
+        try:
+            version = tuple(
+                int(part) for part in result.stdout.strip().removeprefix("v").split(".")
+            )
+        except ValueError:
+            continue
+        if result.returncode == 0 and version >= (24, 18, 1):
+            return node
     raise click.ClickException(
-        "Signal backend not found. Install AsamK/signal-cli (macOS: brew install signal-cli), "
-        "or set SIGNAL_CLI_BACKEND to its executable."
+        "Node.js 24.18.1+ is required for official libsignal. Install Node.js, then run signal-cli setup."
     )
+
+
+def native_node() -> str:
+    """Locate the runtime and installed official cryptography library."""
+    node = node_runtime()
+    if not (NATIVE_ROOT / "node_modules/@signalapp/libsignal-client").is_dir():
+        raise click.ClickException(
+            "Official libsignal is not installed. Run signal-cli setup."
+        )
+    return node
 
 
 class Client:
@@ -44,29 +59,54 @@ class Client:
         self.account = account
 
     def command(self, *args: str, account: bool = True) -> list[str]:
-        command = [backend_path(), "--data-dir", str(self.data_dir)]
+        command = [
+            native_node(),
+            "--disable-warning=ExperimentalWarning",
+            str(NATIVE_ROOT / "runtime.mjs"),
+            "--data-dir",
+            str(self.data_dir),
+        ]
         if account and self.account:
             command += ["--account", self.account]
         return [*command, *args]
 
+    @contextmanager
+    def lock(self):
+        """Serialize ratchet changes across all commands for this store."""
+        self.data_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        fd = os.open(self.data_dir / "native.lock", os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as error:
+                raise click.ClickException(
+                    "Another Signal command is using this account store; retry when it finishes."
+                ) from error
+            yield
+        finally:
+            os.close(fd)
+
     def run(self, *args: str, account: bool = True):
         try:
-            result = subprocess.run(
-                self.command("--output", "json", *args, account=account),
-                capture_output=True,
-                text=True,
-                timeout=120,
-                check=False,
-            )
+            with self.lock():
+                result = subprocess.run(
+                    self.command("--output", "json", *args, account=account),
+                    capture_output=True,
+                    text=True,
+                    timeout=360,
+                    check=False,
+                )
         except (OSError, subprocess.TimeoutExpired) as error:
             raise click.ClickException(str(error)) from error
         if result.returncode:
-            raise click.ClickException(result.stderr.strip() or "Signal backend failed")
+            raise click.ClickException(
+                result.stderr.strip() or "Native Signal client failed"
+            )
         try:
             return json.loads(result.stdout)
         except ValueError as error:
             raise click.ClickException(
-                "Signal backend returned invalid JSON"
+                "Native Signal client returned invalid JSON"
             ) from error
 
     def select_account(self) -> str:
@@ -240,16 +280,75 @@ def cli(ctx, account, data_dir):
 
 
 @cli.command()
-@click.option("--name", default="personal-cli", show_default=True)
-@click.pass_obj
-def login(client, name):
-    """Link your phone by QR code. Example: signal-cli login --name laptop."""
-    # Inherited terminal output lets the native client render its pairing QR code.
+def setup():
+    """Install the official crypto library. Example: signal-cli setup."""
+    node = node_runtime()
+    environment = {
+        **os.environ,
+        "PATH": str(Path(node).parent) + os.pathsep + os.environ.get("PATH", ""),
+    }
+    npm = shutil.which("npm", path=environment["PATH"])
+    if not npm:
+        raise click.ClickException(
+            "Install Node.js with npm, then run signal-cli setup."
+        )
     result = subprocess.run(
-        client.command("link", "--name", name, account=False), check=False
+        [npm, "ci", "--ignore-scripts", "--prefix", str(NATIVE_ROOT)],
+        check=False,
+        env=environment,
     )
     if result.returncode:
-        raise click.ClickException("Signal linking failed; retry signal-cli login.")
+        raise click.ClickException("Official libsignal installation failed.")
+
+
+@cli.command()
+@click.option("--name", default="personal-cli", show_default=True)
+@click.option(
+    "--history/--no-history", default=True, help="Request phone history during pairing."
+)
+@click.option(
+    "--json", "as_json", is_flag=True, help="Emit pairing events as JSON lines."
+)
+@click.option(
+    "--qr-file", type=click.Path(path_type=Path), help="Save the pairing QR as a PNG."
+)
+@click.pass_obj
+def login(client, name, history, as_json, qr_file):
+    """Link your phone by QR code. Example: signal-cli login --name laptop."""
+    import qrcode
+
+    args = ["link", "--name", name, *([] if history else ["--no-history"])]
+    with (
+        client.lock(),
+        subprocess.Popen(
+            client.command(*args, account=False), stdout=subprocess.PIPE, text=True
+        ) as process,
+    ):
+        try:
+            for line in process.stdout:
+                event = json.loads(line)
+                if event.get("type") == "link":
+                    code = qrcode.QRCode(border=2)
+                    code.add_data(event["uri"])
+                    if qr_file:
+                        code.make_image().save(qr_file)
+                    if as_json:
+                        emit(event, True)
+                    else:
+                        code.print_ascii(invert=True)
+                        click.echo(
+                            "Scan in Signal > Settings > Linked Devices; choose Transfer Message History."
+                        )
+                else:
+                    emit(event, True)
+            if process.wait():
+                raise click.ClickException(
+                    "Signal linking failed; retry signal-cli login."
+                )
+        except BaseException:
+            if process.poll() is None:
+                process.terminate()
+            raise
 
 
 @cli.command()
@@ -267,7 +366,7 @@ def status(client, as_json):
 def list_chats(client, as_json, limit):
     """List known contacts and groups. Example: signal-cli list --json."""
     client.select_account()
-    emit(client.peers()[:limit], as_json)
+    emit(sorted(client.peers(), key=lambda peer: not peer["group"])[:limit], as_json)
 
 
 @cli.command()
@@ -277,43 +376,16 @@ def list_chats(client, as_json, limit):
 def pull(client, seconds, as_json):
     """Receive queued text into the inbox. Example: signal-cli pull --seconds 10."""
     client.select_account()
-    command = client.command(
-        "--output",
-        "json",
-        "receive",
-        "--timeout",
-        str(seconds),
-        "--ignore-attachments",
-        "--ignore-stories",
-        "--ignore-avatars",
-        "--ignore-stickers",
-    )
-    count = 0
-    with closing(client.database()) as db:
-        try:
-            with subprocess.Popen(
-                command, stdout=subprocess.PIPE, text=True
-            ) as process:
-                try:
-                    for line in process.stdout:
-                        client.save(db, json.loads(line))
-                        count += 1
-                except BaseException:
-                    # A parser failure or interruption must not leave a mailbox consumer running.
-                    if process.poll() is None:
-                        process.terminate()
-                    raise
-                if process.wait():
-                    raise click.ClickException(
-                        "Signal receive failed; previously cached messages are retained."
-                    )
-        except (ValueError, KeyError, TypeError, AttributeError) as error:
-            raise click.ClickException(
-                "Invalid receive event; previously cached messages are retained."
-            ) from error
-        except OSError as error:
-            raise click.ClickException(str(error)) from error
-    emit({"received_events": count}, as_json)
+    emit(client.run("receive", "--timeout", str(seconds)), as_json)
+
+
+@cli.command()
+@click.option("--json", "as_json", is_flag=True)
+@click.pass_obj
+def backfill(client, as_json):
+    """Import history offered during pairing. Example: signal-cli backfill --json."""
+    client.select_account()
+    emit(client.run("importHistory"), as_json)
 
 
 @cli.command()
@@ -381,6 +453,7 @@ def send(client, peer, text, doc, from_stdin, yes, as_json):
 
 cli.add_command(pull, "sync")
 cli.add_command(list_chats, "chats")
+cli.add_command(backfill, "history")
 
 # Signal follows the same app-managed write restrictions as the other connectors.
 from wa.onebrain_policy import install as _install_policy
