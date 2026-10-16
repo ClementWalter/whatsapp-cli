@@ -101,6 +101,21 @@ export function createKeys(identityBytes) {
 	};
 }
 
+export function deviceAttributes(name, aciKeys, pniKeys) {
+	return {
+		fetchesMessages: true,
+		name,
+		registrationId: aciKeys.state.registrationId,
+		...(pniKeys ? { pniRegistrationId: pniKeys.state.registrationId } : {}),
+		// Accounts with username sync enabled reject clients that downgrade it.
+		capabilities: {
+			spqr: true,
+			profiles_v2: true,
+			usernameChangeSyncMessage: true,
+		},
+	};
+}
+
 export async function link(db, name, history, output) {
 	const privateKey = S.PrivateKey.generate();
 	let resolveEnvelope;
@@ -184,15 +199,7 @@ export async function link(db, name, history, output) {
 			"/v1/devices/link",
 			{
 				verificationCode: message.provisioningCode,
-				accountAttributes: {
-					fetchesMessages: true,
-					name: deviceName,
-					registrationId: aciKeys.state.registrationId,
-					...(pniKeys
-						? { pniRegistrationId: pniKeys.state.registrationId }
-						: {}),
-					capabilities: { spqr: true, profiles_v2: true },
-				},
+				accountAttributes: deviceAttributes(deviceName, aciKeys, pniKeys),
 				aciSignedPreKey: aciKeys.signed,
 				aciPqLastResortPreKey: aciKeys.pq,
 				...(pniKeys

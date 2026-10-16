@@ -109,6 +109,8 @@ export function ingestText(db, account, chat, sender, timestamp, message) {
 }
 
 export function normalized(account, decoded) {
+	// Username changes invalidate any locally retained username hint.
+	if (decoded.content.syncMessage?.usernameChange) delete account.username;
 	const sync = decoded.content.syncMessage?.sent;
 	const data = sync?.message || decoded.content.dataMessage;
 	if (!data) return null;
