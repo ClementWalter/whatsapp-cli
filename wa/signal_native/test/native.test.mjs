@@ -16,7 +16,7 @@ import {
 	importHistory,
 	validateArchive,
 } from "../history.mjs";
-import { createKeys, decryptProvision } from "../link.mjs";
+import { createKeys, decryptProvision, deviceAttributes } from "../link.mjs";
 import { cdnRequest } from "../network.mjs";
 import { b64, encode, pad, type, unpad } from "../protocol.mjs";
 import { decryptEnvelope, drain, ingestText, normalized } from "../receive.mjs";
@@ -26,6 +26,22 @@ import { database, persist, select, stores } from "../store.mjs";
 
 const aliceId = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 const bobId = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+
+test("device registration preserves required account capabilities", () => {
+	const keys = { state: { registrationId: 123 } };
+	assert.deepEqual(deviceAttributes("encrypted-name", keys).capabilities, {
+		spqr: true,
+		profiles_v2: true,
+		usernameChangeSyncMessage: true,
+	});
+});
+
+test("username sync invalidates the account username hint", () => {
+	const a = account();
+	a.username = "old.123";
+	normalized(a, { content: { syncMessage: { usernameChange: {} } } });
+	assert.equal(Object.hasOwn(a, "username"), false);
+});
 
 test("completed history imports are safe to retry", async () => {
 	const a = account();
