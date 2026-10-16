@@ -1,235 +1,244 @@
-# whatsapp-cli
+# WhatsApp & Signal CLI
 
-A separate `signal-cli` command supports Signal alongside `wa`. Signal and
-WhatsApp share encryption concepts, but use different services and transports.
-Signal connects directly through the client in `wa/signal_native/`, using
-Signal's official `libsignal` library for cryptography and network connections.
-It does not require a third-party Signal executable or daemon.
+Read and send your personal **WhatsApp and Signal messages from the terminal**.
+One repository, two commands, separate linked-device accounts and local stores:
 
-## Signal
+| | WhatsApp | Signal |
+| --- | --- | --- |
+| Command | `wa` | `signal-cli` |
+| Pairing | Scan a QR with WhatsApp | Scan a QR with Signal |
+| Receive messages | `wa pull` | `signal-cli pull` |
+| List chats | `wa list` | `signal-cli list` |
+| Read a thread | `wa read "Alice"` | `signal-cli read "Alice"` |
+| Send text or files | Sends immediately | Preview first; add `--yes` to send |
+| Older messages | Phone history sync and read auto-extension | Phone history transfer during pairing |
+| Runtime | Python 3.11+ and uv | Python 3.11+, uv, Node.js 24.18.1+, npm |
 
-Requires Python 3.11+, uv, and Node.js 24.18.1+ with npm. The checkout launcher
-is `./bin/signal-cli`; installing this package also exposes `signal-cli` on PATH.
-The Python command interface reuses the existing CLI and inbox conventions;
-the repository-owned JavaScript client uses the official native Rust library
-through its Node bindings. `setup` installs exact locked dependencies.
+Both clients connect directly to their respective services and decrypt messages
+locally. WhatsApp uses a Python protocol implementation; Signal uses this
+repository's JavaScript client with Signal's official native `libsignal` library.
+Signal requires no third-party backend executable or daemon. The `signal-cli`
+command here belongs to this project; it is separate from AsamK's `signal-cli`.
+
+## Get started
+
+Install [uv](https://github.com/astral-sh/uv) and Python 3.11+. For Signal, also
+install Node.js 24.18.1+ with npm.
+
+```bash
+git clone https://github.com/ClementWalter/whatsapp-cli.git
+cd whatsapp-cli
+```
+
+The launchers in `bin/` use PEP 723 metadata, so uv resolves their Python
+dependencies automatically. No Python package installation is required.
+
+### WhatsApp
+
+```bash
+./bin/wa login
+./bin/wa status
+./bin/wa pull
+./bin/wa list
+./bin/wa read "Alice"
+```
+
+Scan the pairing QR from **WhatsApp → Settings → Linked Devices**.
+
+### Signal
 
 ```bash
 ./bin/signal-cli setup
-./bin/signal-cli login                 # scan QR, choose Transfer Message History
+./bin/signal-cli login
 ./bin/signal-cli status --json
-./bin/signal-cli pull                  # receive queued text
-./bin/signal-cli list --json           # known contacts and groups
-./bin/signal-cli read Alice --json     # locally received text
-./bin/signal-cli backfill --json       # retry a pending pairing history import
-./bin/signal-cli send Alice hello      # preview only
-./bin/signal-cli send Alice hello --yes
+./bin/signal-cli pull
+./bin/signal-cli list --json
+./bin/signal-cli read "Alice" --limit 50
 ```
 
-`send` also accepts `--doc FILE` and `--stdin`. Names must resolve uniquely;
-exact phone numbers, UUIDs, `u:` usernames, and known group IDs are supported.
-`sync` aliases `pull`; `chats` aliases `list`. Use `--account NUMBER_OR_ACI`
-(or `SIGNAL_ACCOUNT`) when multiple accounts are linked. `--data-dir PATH`
-selects an independent account store and inbox. `login --json --qr-file FILE`
-emits machine-readable pairing events and saves a scannable PNG. Use
-`login --no-history` to pair without requesting older messages.
+`setup` installs the exact locked Node dependencies. Scan the QR from
+**Signal → Settings → Linked Devices**, then accept **Transfer Message History**
+to import older messages. Keep the login command running until the transfer
+finishes. Use `login --no-history` to link without importing history.
 
-The default data directory is `$XDG_DATA_HOME/signal-cli`, falling back to
-`~/.local/share/signal-cli`. Credentials, ratchets, encrypted receive queues,
-and text history live in the private `inbox.sqlite3`, scoped by account. Native
-commands serialize changes to ratchets. The receiver commits an encrypted copy
-before acknowledging delivery; failed decryption remains queued for retry.
-Receiving does not send read receipts or download incoming attachments.
-The local inbox excludes disappearing and view-once content. Edits, reactions,
-and stories are not presented. Known groups appear before contacts in `list`.
-
-Pairing requests Signal's encrypted history transfer. The phone must approve
-Transfer Message History; the client verifies the archive's HMAC, decrypts it,
-validates the backup frames with libsignal, and imports ordinary text. A
-successful import deletes the ephemeral transfer key. `backfill` retries a
-pending transfer; a device paired without a history key must pair again.
-Native pairing and file-upload compatibility require verification against the
-user's account; offline tests do not prove every live service interaction.
-
-If a previous version used AsamK's client, native startup imports its existing
-credentials, ratchets, contacts, and groups from the local store without
-invoking that executable. Original files are retained. Stop using the old
-client for that linked device after migration: two independent ratchet stores
-for one device would diverge. A new native pairing retains the previous native
-credentials in the private database and preserves the inbox.
-
-## WhatsApp
-
-A pure-Python WhatsApp client that pairs as a **linked device** and gives you
-your own chats from the terminal:
+To save a pairing image you can open separately:
 
 ```bash
-wa pull                 # catch up the server mailbox
-wa list                 # 1 row per conversation
-wa read "alice"         # show a thread
-wa send "alice" "hi"    # send a text (1:1 or group)
-wa send "alice" --doc report.pdf   # share a document (PDF or any file)
+./bin/signal-cli login --qr-file pairing.png
 ```
 
-Not the Cloud Business API (which cannot read personal chats), not a Playwright
-browser scraper. The client speaks WhatsApp's native protocol: Noise XX over
-WebSocket, Signal Double Ratchet for messages, Sender Keys for groups,
-LtHash-verified app-state sync for chat metadata.
+QR codes expire; generate a new one if pairing closes before phone approval.
 
-## Install
+### Put both commands on PATH
 
-Requires Python 3.11+ and [uv](https://github.com/astral-sh/uv).
-
-Two ways:
-
-**A — Bundled launcher.** No install step. Clone the repo and invoke
-`wa` directly; the `#!/usr/bin/env -S uv run --script` shebang and
-PEP 723 inline metadata make `uv` pull deps on the first run.
+From the checkout, link the launchers into a directory on your PATH:
 
 ```bash
-git clone <repo> whatsapp-cli
-cd whatsapp-cli
-./bin/wa login                          # pair (one-time QR scan)
-./bin/wa status
+mkdir -p ~/.local/bin
+ln -s "$(pwd)/bin/wa" ~/.local/bin/wa
+ln -s "$(pwd)/bin/signal-cli" ~/.local/bin/signal-cli
 ```
 
-**B — Global tool install.** Puts a `wa` command on PATH; the rest of
-the docs use that shorter form interchangeably with `wa`.
+The examples below use these shorter command names. Symlinks run the current
+checkout, so pulling updates does not require reinstalling the commands.
+
+## Daily use
+
+### WhatsApp
 
 ```bash
-uv tool install --from ./whatsapp-cli whatsapp-cli
-wa login
+wa pull                              # receive the queued mailbox
+wa list --limit 200 --json            # cached conversations
+wa read "Alice" --limit 50
+wa read "Alice" --match 2             # choose a match after an ambiguity warning
+wa read "Alice" --no-extend --json    # cached messages only
+wa listen                            # stay connected; stream messages as JSON lines
+wa backfill --minutes 15              # keep the connection open for phone history
+wa import-contacts                   # macOS Contacts.app names
 ```
 
-State lives under `~/.config/whatsapp-cli/` (keys) and
-`~/.cache/whatsapp-cli/` (chats, contacts, message history). To
-uninstall cleanly, `uv tool uninstall whatsapp-cli` and `rm -rf` both
-directories.
+For phone history sync, keep WhatsApp open in the foreground on the phone
+while `backfill` runs. `pull` drains the server queue and normally exits after
+three seconds of silence; it does not copy the phone's entire database.
 
-(If you previously ran a version that stored state under
-`~/.config/whatsapp-user-cli/`, the CLI auto-renames those directories
-on first import — your pairing is preserved.)
-
-## Daily usage
+### Signal
 
 ```bash
-wa pull                              # ~3s if nothing new, longer for a backlog
-wa list                              # 20 most-recent conversations
-wa list --limit 200 --json           # everything, machine-readable
-wa read "alice"                      # show alice's thread; auto-fetches more if cache is short
-wa read "alice" --match 2            # disambiguate when multiple "alices" match
-wa read 33123456789@s.whatsapp.net   # exact JID, never ambiguous
-wa send "alice" "running 10 min late"
-wa send "Football" "see you at 7pm"  # groups work too
-wa send "alice" "see attached" --doc report.pdf   # document with a caption
-wa import-contacts                   # macOS only: pull names from Contacts.app
+signal-cli pull --seconds 10 --json   # receive queued text into the local inbox
+signal-cli list --limit 100 --json    # known groups and contacts; groups first
+signal-cli read "Alice" --limit 50
+signal-cli read "Alice" --json
+signal-cli backfill --json            # retry a pending pairing history import
 ```
 
-`wa --help` lists every subcommand; `wa <cmd> --help` for per-command options
-including `--json`, `--limit`, `--seconds`, `--idle`, `--refresh-groups`,
-`--no-extend`, `--match`, `--reset`, `--dry-run`.
+`read` displays cached text in chronological order. Run `pull` first for new
+messages. Names must resolve uniquely; exact phone numbers, UUIDs, `u:`
+usernames, and known group IDs are also accepted.
 
-## Use as an LLM skill
+Use `--account NUMBER_OR_ACI` before the command, or set `SIGNAL_ACCOUNT`,
+when multiple Signal accounts are linked. `--data-dir PATH` selects an
+independent account store and inbox.
 
-The repo ships with a `SKILL.md` and a self-contained launcher at `wa`,
-both at the project root. The skill is published in the
-[Vercel Labs `skills`](https://github.com/vercel-labs/skills) format — same
-YAML frontmatter + markdown body that the `npx skills` CLI installs, and
-the same layout other agentic systems consume.
+Both commands provide `sync` as an alias for `pull`, `chats` for `list`, and
+`history` for `backfill`. Their options and history behavior differ; use
+`wa <command> --help` or `signal-cli <command> --help` for details.
 
-### Install via `npx skills`
+### Understanding history and message limits
+
+`--limit 50` means **up to 50 available messages**, not a guarantee that the
+client can retrieve 50 messages from the service.
+
+| | WhatsApp | Signal |
+| --- | --- | --- |
+| New messages | `pull` receives the server mailbox | `pull` receives the server mailbox |
+| Reading older messages | `read` requests older phone history when the cache is short; `--no-extend` disables this | `read` queries the local inbox only |
+| Importing phone history | `backfill` holds a connection open for phone history pushes | Accept Transfer Message History during `login` |
+| Retrying history | Run `backfill` with the phone foregrounded | Run `backfill` to retry the pending pairing archive |
+
+A Signal device paired without a transfer key must pair again to request
+phone history. Increasing `--limit` or rerunning `pull` cannot recover that
+history. Once an archive has been imported, `backfill` reports it as already
+imported. An empty server queue does not establish that either client's local
+history matches everything on the phone.
+
+## Send messages and files
+
+WhatsApp sends immediately. Use an exact JID when the destination matters:
+a bare phone number can match a legacy group JID containing that number.
+
+```bash
+wa send 33123456789@s.whatsapp.net "Running late"
+wa send "Football" "See you at 7pm"
+wa send "Alice" "See attached" --doc report.pdf
+wa send "Alice" "Agreed" --reply-to MESSAGE_ID
+wa download MESSAGE_ID -o downloads/
+```
+
+`MESSAGE_ID` comes from `wa read <chat> --json`. Documents are encrypted and
+uploaded before sending; `download` decrypts attachments from cached messages.
+
+Signal previews sends by default. Add `--yes` to transmit:
+
+```bash
+signal-cli send "Alice" "Running late"
+signal-cli send "Alice" "Running late" --yes
+signal-cli send "Alice" "See attached" --doc report.pdf --yes
+```
+
+Signal also accepts `--stdin` for message text. Text and file sends support
+direct conversations and known groups. Live pairing, text reception, and
+history transfer have been verified; live file uploads still need verification.
+
+## Storage and current scope
+
+| | WhatsApp | Signal |
+| --- | --- | --- |
+| Credentials | `~/.config/whatsapp-cli/` | Private `inbox.sqlite3` in the Signal data directory |
+| Cached messages | `~/.cache/whatsapp-cli/` | The same account-scoped SQLite database |
+| Default Signal data directory | — | `$XDG_DATA_HOME/signal-cli`, or `~/.local/share/signal-cli` |
+| Continuous reception | `wa listen` | Run `pull` to receive queued messages |
+| Incoming attachments | Download with `wa download` | Not downloaded |
+
+Signal's receive queue commits an encrypted copy before acknowledging delivery.
+Failed decryption remains queued for retry. Receiving does not send read receipts.
+The Signal inbox excludes disappearing and view-once content; edits, reactions,
+and stories are not presented. The phone may currently show the linked device
+as unnamed.
+
+WhatsApp implements QR pairing, Noise XX transport, direct and group message
+encryption, app-state sync, history sync, text/document sends, replies, and
+attachment downloads. History completeness depends on what the phone and
+service deliver. Reactions and edits are not implemented.
+
+If migrating from an earlier version that used AsamK's Signal client, native
+startup imports its local credentials, ratchets, contacts, and groups without
+launching that executable. Original files remain on disk. Stop using the old
+client for that device: separate ratchet stores would diverge. Fresh native
+pairing preserves the inbox and retains previous native credentials privately.
+
+## Use with coding agents
+
+The existing [SKILL.md](SKILL.md) documents WhatsApp workflows and can be
+installed with:
 
 ```bash
 npx skills add ClementWalter/whatsapp-cli
 ```
 
-This drops the skill under `~/.agents/skills/whatsapp-cli/` and
-symlinks it into every supported agent runtime that's installed on your
-machine (Claude Code, Cursor, Windsurf, Codex, Gemini CLI, …). Agents
-then drive the CLI by invoking the bundled `wa` script directly.
-
-### Install locally (development / unpublished)
-
-```bash
-# Option 1 — symlink so the skill picks up live edits.
-mkdir -p ~/.claude/skills
-ln -s "$(pwd)" ~/.claude/skills/whatsapp-cli
-
-# Option 2 — copy a frozen snapshot.
-cp -R . ~/.claude/skills/whatsapp-cli
-```
-
-Either way, agents that scan `~/.claude/skills/` (or
-`~/.agents/skills/`) will load `SKILL.md` and resolve commands against
-the sibling `wa` launcher. No separate `uv tool install` needed —
-`wa` is self-contained via PEP 723.
-
-Trigger phrases include "send a WhatsApp message", "read my WhatsApp
-chats", "catch me up on WhatsApp".
+The bundled launchers are `bin/wa` and `bin/signal-cli`, relative to the
+checkout or skill directory. Agents can discover Signal commands through
+`bin/signal-cli --help`. Signal read commands support `--json`; WhatsApp
+supports it on `list` and `read`. Signal pairing with `login --json` emits
+JSON events, including the QR URI and transfer result.
 
 ## Development
 
-Signal protocol tests use the official library and run without an account:
+Run focused tests first, then the full suite. Native Signal tests exercise
+the official library without requiring an account:
 
 ```bash
-signal-cli setup
-npm test --prefix wa/signal_native
+./bin/signal-cli setup
 uv run --group test pytest tests/test_signal_cli.py -q
+npm test --prefix wa/signal_native
+uv run --group test pytest tests/ -q
 ```
 
-```bash
-# One-time: build the Go oracle (used as the byte-for-byte reference for tests).
-cd tools/oracle && go build -o oracle .
+| Path | Purpose |
+| --- | --- |
+| `bin/wa`, `bin/signal-cli` | Checkout launchers |
+| `wa/cli.py` | WhatsApp command interface |
+| `wa/signal_cli.py` | Signal command interface and inbox reads |
+| `wa/signal_native/` | Signal provisioning, transport, crypto stores, messaging, history |
+| `wa/wabinary/`, `wa/crypto/`, `wa/transport/`, `wa/signal/` | WhatsApp protocol implementation |
+| `tests/` | Python tests |
+| `wa/signal_native/test/` | Native Signal tests |
+| `tools/oracle/` | Go reference implementation for WhatsApp codec tests |
 
-# Run the test suite. uv resolves dev deps from pyproject.toml's `test` group.
-uv run --group test pytest tests/ -v
+Python dependencies are pinned in `pyproject.toml` and `uv.lock`. They include
+Click, qrcode, aiohttp, cryptography, protobuf, and the Rust-backed
+`signal-protocol` binding used by WhatsApp. macOS contact import additionally
+uses PyObjC. Signal's official `@signalapp/libsignal-client` and `protobufjs`
+dependencies are locked in `wa/signal_native/package-lock.json`.
 
-# Iterate without reinstalling — PEP 723 launcher pulls deps inline.
-./bin/wa list
-
-# After editing source, reinstall the console script.
-# (`--reinstall` is required: uv sees the version unchanged and won't rebuild
-# under plain `--force`.)
-uv tool install --reinstall --from . whatsapp-cli
-```
-
-## Status
-
-| Stage | Scope                                                | State |
-| ----- | ---------------------------------------------------- | ----- |
-| 1     | Binary XML codec (tokens, nodes, JIDs, packing)      | ✅    |
-| 2     | Noise XX handshake + WebSocket transport             | ✅    |
-| 3     | QR pairing + device registration                     | ✅    |
-| 4     | Login, keepalive, IQ round-trip                      | ✅    |
-| 5     | Signal session, message decrypt (DM + group)         | ✅    |
-| 6     | CLI surface (status/login/sync/chats/read/send/migrate) | ✅    |
-| 7     | App-state sync — bootstrap history works             | partial |
-| 8     | Media download / upload (AES-CBC + HMAC)             | not yet |
-| 9     | Replies, reactions, edits, deletes                   | not yet |
-
-Reliability features implemented: process lock (prevents racing `wa`
-invocations from corrupting `signal.json`), delivery receipts (sender's `✓✓`
-indicator updates, prevents server from re-queueing the same messages),
-persistent Signal sessions and Sender Keys across runs.
-
-## Dependencies
-
-Not dep-free. Hard runtime requirements (declared in `pyproject.toml`):
-
-- `aiohttp` — WebSocket transport
-- `cryptography` — X25519, AES-GCM, HKDF for Noise
-- `signal-protocol` — Rust-backed libsignal binding (Double Ratchet, Sender Keys)
-- `protobuf` — wire format for handshake / app-state messages
-- `click` — CLI framework
-- `qrcode[pil]` — render pairing QR in the terminal
-- `pyobjc-framework-Contacts` — macOS-only, used by `wa import-contacts`
-
-Only `wa/wabinary/` is pure stdlib.
-
-## Legal posture
-
-Reverse-engineered clients run against WhatsApp's ToS. Meta has historically
-sent cease-and-desist letters to popular libs (e.g. Baileys). This project is
-scoped to **single-user personal tooling**, not a service. Use on a number
-you can afford to have banned; expect periodic breakage when WhatsApp bumps
-protocol tokens; no Meta branding anywhere.
+These are unofficial clients for personal accounts. Service protocol changes
+can require client updates.
