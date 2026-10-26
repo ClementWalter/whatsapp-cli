@@ -13,7 +13,7 @@ import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -193,12 +193,19 @@ def _history_blobs_since(since_ms: int) -> list[Path]:
     )
 
 
-def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
+@dataclass
+class HistoryIngest:
+    """New messages stored, and each conversation's end-of-history verdict."""
+
+    added: int = 0
+    end_types: list[int | None] = field(default_factory=list)
+
+
+def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> HistoryIngest:
     """Fold the history-sync notifications in ``pm_files`` into the cache.
 
     CDN-hosted chunks (every ON_DEMAND reply) are only reachable with
-    ``download``; their links expire within days. Returns the number of
-    new messages stored.
+    ``download``; their links expire within days.
     """
     from wa.cache import (
         CachedMessage,
@@ -214,6 +221,7 @@ def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
         upsert_chat,
     )
     from wa.history import (
+        conversation_end_type,
         conversation_name,
         decode_history_sync_notification,
         iter_conversation_messages,
@@ -229,6 +237,7 @@ def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
     new_contacts = 0
     new_lid = 0
     skipped_dup = 0
+    end_types: list[int | None] = []
 
     for pm_path in pm_files:
         try:
@@ -286,6 +295,7 @@ def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
             if not chat_jid:
                 continue
             chat_jid = canonical_jid(chat_jid, lidmap_inverted=lid_of_pn)
+            end_types.append(conversation_end_type(conv_bytes))
             if chat_jid not in chats:
                 new_chats += 1
             existing = chats.get(chat_jid, {})
@@ -325,7 +335,7 @@ def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
         ),
         err=True,
     )
-    return len(new_messages)
+    return HistoryIngest(added=len(new_messages), end_types=end_types)
 
 
 @cli.command(name="import-contacts")
@@ -3154,8 +3164,10 @@ class PageResult:
 
     ``stop`` names why it ended: ``count`` (got what was asked), ``since``
     (reached the target date), ``no_reply`` (the phone stayed silent),
-    ``no_older`` (the phone answered with nothing new: start of the chat
-    on the phone), or ``no_anchor`` (nothing cached to page back from).
+    ``no_older`` (the phone says the chat starts here), ``no_access`` (the
+    phone says older messages exist but refuses to serve them),
+    ``nothing_new`` (the phone answered without anything new), or
+    ``no_anchor`` (nothing cached to page back from).
     """
 
     gained: int = 0
@@ -3166,7 +3178,7 @@ class PageResult:
 async def _page_on_demand(
     *,
     oldest: Callable[[], CachedMessage | None],
-    request: Callable[[CachedMessage, int], Awaitable[int | None]],
+    request: Callable[[CachedMessage, int], Awaitable[tuple[int, int | None] | None]],
     count: int,
     since_ts: int | None = None,
     page: int = ON_DEMAND_PAGE,
@@ -3175,9 +3187,12 @@ async def _page_on_demand(
 
     ``oldest`` returns the chat's oldest cached message (the anchor);
     ``request`` asks the phone for ``n`` messages older than it and returns
-    how many new messages landed, or ``None`` when the phone did not reply.
-    Each page re-anchors on the oldest message the previous page stored.
+    ``(new messages stored, endOfHistoryTransferType)``, or ``None`` when the
+    phone did not reply. Each page re-anchors on the oldest message the
+    previous page stored.
     """
+    from wa.history import END_COMPLETE_NOTHING_MORE, END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS
+
     result = PageResult()
     while result.gained < count:
         anchor = oldest()
@@ -3188,14 +3203,21 @@ async def _page_on_demand(
             result.stop = "since"
             return result
         result.requests += 1
-        got = await request(anchor, min(page, count - result.gained))
-        if got is None:
+        reply = await request(anchor, min(page, count - result.gained))
+        if reply is None:
             result.stop = "no_reply"
             return result
-        if got <= 0:
+        got, end_type = reply
+        result.gained += got
+        if end_type == END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS:
+            result.stop = "no_access"
+            return result
+        if end_type == END_COMPLETE_NOTHING_MORE:
             result.stop = "no_older"
             return result
-        result.gained += got
+        if got <= 0:
+            result.stop = "nothing_new"
+            return result
     result.stop = "count"
     return result
 
@@ -3241,7 +3263,7 @@ def _ingest_new_history(since_ms: int, skip: set[Path] | frozenset[Path] = froze
         for p in _history_blobs_since(since_ms)
         if p not in skip and _blob_hsn(p) is not None
     ]
-    return _ingest_history_blobs(files, download=True) if files else 0
+    return _ingest_history_blobs(files, download=True).added if files else 0
 
 
 async def _extend_chat(
@@ -3339,7 +3361,7 @@ async def _extend_chat_once(
             # earlier one still re-anchors the walk.
             sent_ids: set[str] = set()
 
-            async def request(anchor: CachedMessage, n: int) -> int | None:
+            async def request(anchor: CachedMessage, n: int) -> tuple[int, int | None] | None:
                 log.info(
                     "anchor: %s id=%s from_me=%s — requesting %d older messages",
                     _date(anchor.ts), anchor.msg_id, anchor.from_me, n,
@@ -3355,7 +3377,7 @@ async def _extend_chat_once(
 
             async def send_and_wait(
                 request_jid: str, anchor: CachedMessage, n: int
-            ) -> int | None:
+            ) -> tuple[int, int | None] | None:
                 padded = pad_for_signal(
                     build_peer_data_request(
                         chat_jid=request_jid,
@@ -3415,7 +3437,9 @@ async def _extend_chat_once(
                     log.info("no reply to %s", request_id)
                     return None
                 ingested.update(replies)
-                return await asyncio.to_thread(_ingest_history_blobs, replies, download=True)
+                result = await asyncio.to_thread(_ingest_history_blobs, replies, download=True)
+                end_type = result.end_types[-1] if result.end_types else None
+                return result.added, end_type
 
             return await _page_on_demand(
                 oldest=lambda: _oldest_cached(chat_jid),
@@ -3446,6 +3470,12 @@ _STOP_REASONS = {
     "open in the foreground on the phone; retry, or see SKILL.md "
     "'Recovering missing messages')",
     "no_older": "your phone has nothing older for this chat",
+    "no_access": "your phone reports older messages exist on it but refuses to "
+    "serve them to linked devices (endOfHistoryTransferType NO_ACCESS); read them "
+    "on the phone, or export the chat there (see SKILL.md 'Recovering missing "
+    "messages')",
+    "nothing_new": "your phone answered without anything new; retry in a few "
+    "minutes with WhatsApp foregrounded",
     "no_anchor": "nothing is cached for this chat to page back from",
     "skipped": "--no-extend skipped asking the phone",
     "count": "",

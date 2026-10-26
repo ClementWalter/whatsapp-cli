@@ -167,9 +167,10 @@ carries `coverage: {cached, oldest_date, stop, complete, note}`; text mode
 prints the same `note` on stderr. A non-null `note` starts with `PARTIAL:`
 and means the cache does not reach as far back as was asked — never report
 "not found" from a `PARTIAL` read. `stop` says why paging ended: `count` /
-`since` (got what was asked), `no_older` (`complete: true`, the phone has
-nothing older), `no_reply` (the phone stayed silent), `skipped`
-(`--no-extend`).
+`since` (got what was asked), `no_older` (`complete: true`, the phone says
+the chat starts there), `no_access` (the phone says older messages exist but
+refuses to serve them), `nothing_new` (the phone answered without anything
+new), `no_reply` (the phone stayed silent), `skipped` (`--no-extend`).
 
 **The auto-extend only walks backwards.** It asks the phone for messages
 *older* than the oldest it already holds, so raising `--limit` never fetches
@@ -379,9 +380,16 @@ is true of this path (verified live, 2026-10-26):
   again. Rerunning the same `read --since` resumes from the oldest cached
   message, so a `no_reply` stop is worth one or two retries a few minutes
   apart, with WhatsApp foregrounded.
-- An empty answer (`stop: "no_older"`, `complete: true`) means the phone's own
-  copy of that chat starts there. Anything older is not on the phone under
-  that chat: look for it in another chat (an old number, a group) or a backup.
+- Each answer carries the phone's verdict
+  (`Conversation.endOfHistoryTransferType`), and paging stops on it:
+  `1` = the chat really starts here (`no_older`, `complete: true`);
+  `3` = **older messages exist on the phone but it will not serve them to a
+  linked device** (`no_access`). Type 3 is a hard phone-side cutoff, not
+  sleep: on 2026-10-26 one 1:1 chat stopped at 2023-05-15 with type 3
+  on every retry while the phone was awake and answering, although the user
+  could read (and forward) 2022 messages of that chat on the phone. Retrying,
+  changing the anchor, or flipping the JID form does not move it. For
+  `no_access`, go straight to the fallback below.
 
 **Fallback when the phone will not serve it:** on the phone, open the chat →
 contact name → *Export chat* → *Without media*, and save/share the `.txt`

@@ -14,7 +14,14 @@ import pytest
 
 from wa import cli
 from wa.cache import CachedMessage
-from wa.history import decode_history_sync_notification, is_history_sync_notification
+from wa.history import (
+    END_COMPLETE_NOTHING_MORE,
+    END_ON_DEMAND_MORE_ON_PRIMARY,
+    END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS,
+    conversation_end_type,
+    decode_history_sync_notification,
+    is_history_sync_notification,
+)
 from wa.peerreq import _length_delim, _string_field, _varint_field
 from wa.session import InboundSession
 from wa.wabinary import JID, Node, decode_node
@@ -113,7 +120,7 @@ def test_new_history_ingest_downloads_cdn_chunks(blob_dir, monkeypatch):
     monkeypatch.setattr(
         cli,
         "_ingest_history_blobs",
-        lambda files, download: calls.append(download) or 0,
+        lambda files, download: calls.append(download) or cli.HistoryIngest(),
     )
     cli._ingest_new_history(0)
     assert calls == [True]
@@ -148,11 +155,19 @@ class StubPhone:
     """A chat whose phone-side history is ``history`` (newest last).
 
     The cache starts with the newest ``cached`` messages; each request
-    moves up to ``n`` older ones into the cache, like an ON_DEMAND reply.
+    moves up to ``n`` older ones into the cache, like an ON_DEMAND reply,
+    and reports the phone's endOfHistoryTransferType. Messages before
+    ``serves_from`` exist on the phone but are never served (NO_ACCESS).
     ``silent`` makes the phone never answer.
     """
 
-    def __init__(self, history: list[int], cached: int, silent: bool = False) -> None:
+    def __init__(
+        self,
+        history: list[int],
+        cached: int,
+        silent: bool = False,
+        serves_from: int = 0,
+    ) -> None:
         self.phone_only = (
             [_msg(ts) for ts in history[:-cached]]
             if cached
@@ -160,19 +175,35 @@ class StubPhone:
         )
         self.cache = [_msg(ts) for ts in history[-cached:]] if cached else []
         self.silent = silent
+        self.serves_from = serves_from
         self.requests: list[tuple[int, int]] = []
 
     def oldest(self) -> CachedMessage | None:
         return min(self.cache, key=lambda m: m.ts) if self.cache else None
 
-    async def request(self, anchor: CachedMessage, n: int) -> int | None:
+    async def request(self, anchor: CachedMessage, n: int) -> tuple[int, int] | None:
         self.requests.append((anchor.ts, n))
         if self.silent:
             return None
-        older = [m for m in self.phone_only if m.ts < anchor.ts][-n:]
-        self.phone_only = [m for m in self.phone_only if m not in older]
-        self.cache.extend(older)
-        return len(older)
+        older = [m for m in self.phone_only if m.ts < anchor.ts]
+        servable = [m for m in older if m.ts >= self.serves_from][-n:]
+        self.phone_only = [m for m in self.phone_only if m not in servable]
+        self.cache.extend(servable)
+        if len(servable) < len(older) and not [
+            m for m in self.phone_only if self.serves_from <= m.ts < anchor.ts
+        ]:
+            return len(servable), END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS
+        if len(servable) == len(older):
+            return len(servable), END_COMPLETE_NOTHING_MORE
+        return len(servable), END_ON_DEMAND_MORE_ON_PRIMARY
+
+
+class EchoPhone(StubPhone):
+    """A phone that answers every request with messages already cached."""
+
+    async def request(self, anchor: CachedMessage, n: int) -> tuple[int, int]:
+        self.requests.append((anchor.ts, n))
+        return 0, END_ON_DEMAND_MORE_ON_PRIMARY
 
 
 def _walk(phone: StubPhone, count: int, since_ts: int | None = None) -> cli.PageResult:
@@ -208,8 +239,23 @@ def test_paging_gains_what_was_asked():
         (StubPhone(list(range(1, 201)), cached=10, silent=True), 120, None, "no_reply"),
         (StubPhone(list(range(1, 201)), cached=10), 5000, 100, "since"),
         (StubPhone(list(range(1, 201)), cached=0), 120, None, "no_anchor"),
+        (
+            StubPhone(list(range(1, 201)), cached=10, serves_from=150),
+            500,
+            None,
+            "no_access",
+        ),
+        (EchoPhone(list(range(1, 201)), cached=10), 120, None, "nothing_new"),
     ],
-    ids=["count", "start-of-chat", "silent-phone", "since", "empty-cache"],
+    ids=[
+        "count",
+        "start-of-chat",
+        "silent-phone",
+        "since",
+        "empty-cache",
+        "phone-refuses-older",
+        "nothing-new",
+    ],
 )
 def test_paging_reports_why_it_stopped(phone, count, since_ts, stop):
     assert _walk(phone, count, since_ts).stop == stop
@@ -412,6 +458,7 @@ def phone_number_history(monkeypatch):
     monkeypatch.setattr(
         history, "conversation_name", lambda conv: (PN_CHAT, "", 1663300000)
     )
+    monkeypatch.setattr(history, "conversation_end_type", lambda conv: None)
     monkeypatch.setattr(
         history,
         "iter_conversation_messages",
@@ -436,3 +483,30 @@ def test_ingested_phone_number_history_is_filed_under_the_lid_chat(
     path = _save_blob(blob_dir, 1000, _protocol_message(inline))
     cli._ingest_history_blobs([path], download=False)
     assert [m.chat for m in store.iter_messages()] == [LID_CHAT]
+
+
+def test_phone_refusal_stops_at_the_last_served_message():
+    phone = StubPhone(list(range(1, 201)), cached=10, serves_from=150)
+    _walk(phone, 500)
+    assert phone.oldest().ts == 150
+
+
+@pytest.mark.parametrize(
+    ("conversation", "expected"),
+    [
+        (_string_field(1, PN_CHAT) + _varint_field(11, 3), 3),
+        (_string_field(1, PN_CHAT) + _varint_field(11, 1), 1),
+        (_string_field(1, PN_CHAT), None),
+    ],
+    ids=["no-access", "nothing-more", "unset"],
+)
+def test_conversation_end_type(conversation, expected):
+    assert conversation_end_type(conversation) == expected
+
+
+def test_refusal_note_says_older_messages_exist_on_the_phone():
+    assert "refuses" in _coverage(stop="no_access")["note"]
+
+
+def test_refusal_is_not_complete():
+    assert _coverage(stop="no_access")["complete"] is False
