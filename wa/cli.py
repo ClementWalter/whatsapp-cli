@@ -3191,7 +3191,10 @@ async def _page_on_demand(
     phone did not reply. Each page re-anchors on the oldest message the
     previous page stored.
     """
-    from wa.history import END_COMPLETE_NOTHING_MORE, END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS
+    from wa.history import (
+        END_COMPLETE_NOTHING_MORE,
+        END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS,
+    )
 
     result = PageResult()
     while result.gained < count:
