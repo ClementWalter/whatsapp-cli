@@ -93,7 +93,8 @@ queued mail but useless when you are waiting on the **phone** — use
 
 ### `wa backfill` / `wa history` `[--minutes N]`
 Hold the socket open (default 15 min, idle exit disabled) so the phone can
-push chat-history sync bundles. Tell the user to open WhatsApp on their phone
+push chat-history sync bundles; whatever it pushes is downloaded and ingested
+when the window closes (so are bundles that arrive during `pull`/`listen`). Tell the user to open WhatsApp on their phone
 **in the foreground with the screen kept awake** for the whole window — the
 phone only serves history while both ends are live, and `pull`'s 3-second
 idle exit closes the socket long before it starts pushing. `history` is an alias.
@@ -133,7 +134,7 @@ limit 20. Offline — does not open a socket. `chats` is an alias.
 `display_name` field falls back to `contacts.json` when the app-state name
 is empty (DMs).
 
-### `wa read <query> [--limit N] [--match N] [--no-extend] [--json]`
+### `wa read <query> [--limit N] [--since YYYY-MM-DD] [--match N] [--no-extend] [--wait S] [--json]`
 Show messages from a single chat. `<query>` is a fuzzy substring match
 against chat names, JIDs, and contact names (case-insensitive). Ambiguous
 queries print a numbered list — pick with `--match N` or pass a full JID.
@@ -145,6 +146,7 @@ wa read 123456789012345@lid     # exact JID, never ambiguous
 wa read famille --limit 100     # bigger window
 wa read alice --no-extend       # offline, cached only — no network
 wa read alice --json            # machine-readable
+wa read alice --since 2022-01-01 --limit 0 --json   # page back to 2022, all of it
 ```
 
 Each `--json` message carries `msg_id`, `quoted_id` and `media`: `quoted_id`
@@ -153,13 +155,26 @@ phone), `""` otherwise; `media` is the attachment's CDN reference (kind,
 mimetype, seconds…) consumed by `wa download`, `null` for text. Plain output renders a quote as `↩︎ «snippet» text`. That is how a
 script tells "he answered *this* message" from "he wrote in the same chat".
 
-Auto-extends from the user's phone if the cache is shorter than `--limit`;
-pass `--no-extend` to disable that network round-trip.
+Auto-extends from the user's phone when the cache is shorter than `--limit`
+or does not reach back to `--since`: it pages older history 50 messages per
+request, re-anchoring on the oldest cached message each time, until it has
+enough, reaches the date, or the phone has nothing older. Each request waits
+up to `--wait` seconds (default 180) for the phone. `--no-extend` skips the
+network round-trip.
+
+**Check `coverage` before concluding anything is absent.** `--json` output
+carries `coverage: {cached, oldest_date, stop, complete, note}`; text mode
+prints the same `note` on stderr. A non-null `note` starts with `PARTIAL:`
+and means the cache does not reach as far back as was asked — never report
+"not found" from a `PARTIAL` read. `stop` says why paging ended: `count` /
+`since` (got what was asked), `no_older` (`complete: true`, the phone has
+nothing older), `no_reply` (the phone stayed silent), `skipped`
+(`--no-extend`).
 
 **The auto-extend only walks backwards.** It asks the phone for messages
-*older* than the oldest it already holds (`requesting N msgs older than
-this`), so raising `--limit` never fetches recent messages — no matter how
-high you push it. For those, see **Recovering missing messages**.
+*older* than the oldest it already holds, so raising `--limit` never fetches
+recent messages — no matter how high you push it. For those, see
+**Recovering missing messages**.
 
 ### `wa send <peer> "<text>"`
 Send a text message — or a document with `--doc`. `<peer>` is a fuzzy match
@@ -310,6 +325,14 @@ wa list --json --limit 500 | jq '.[] | select(.display_name | test("theo"; "i"))
 wa read "alice" --limit 1000 --json --no-extend
 ```
 
+### "What did <someone> tell me about <topic>?" (search old history)
+```bash
+# Page the whole chat in first, then search the JSON. Check coverage.note.
+wa read "<name or JID>" --since 2015-01-01 --limit 0 --json > /tmp/chat.json
+jq '.coverage' /tmp/chat.json
+jq -r '.messages[] | select(.text | test("pitch|deck"; "i")) | "\(.ts|todate) \(.sender_name): \(.text)"' /tmp/chat.json
+```
+
 ## Output and exit codes
 
 - All commands write to stdout/stderr in UTF-8.
@@ -338,6 +361,28 @@ jq -rc 'select(.chat|test("<jid-fragment>"))|[.ts,(.sender_name//"")]|@tsv' \
 
 If the store is current for other chats but stale for this one, delivery is
 the problem, not display.
+
+**Older than the cache** (the chat is current but starts too late, e.g. a
+2022 thread when the cache begins in 2026): `wa read "<chat>" --since
+<date> --limit 0` pages it in from the phone, 50 messages per request. What
+is true of this path (verified live, 2026-10-26):
+
+- The phone answers on-demand requests with a CDN-hosted ON_DEMAND bundle,
+  usually within seconds but sometimes minutes late; a late answer that lands
+  during any later connection is ingested then. CDN links expire within
+  days, which is why ingestion happens on receipt.
+- 1:1 chats must be requested by their **phone-number JID**: the phone
+  silently ignores a request naming the `@lid` form. `read` uses the
+  `lidmap.json` twin first and falls back to the `@lid` form; a 1:1 chat with
+  no known phone number may get no answer at all.
+- `coverage.stop == "no_reply"` with WhatsApp foregrounded on the phone, after
+  a retry, means this path is exhausted for that chat.
+
+**Fallback when the phone will not serve it:** on the phone, open the chat →
+contact name → *Export chat* → *Without media*, and save/share the `.txt`
+somewhere readable (Files, Drive, email to self); read that file directly.
+For a handful of messages, forward them to yourself ("Message yourself"),
+then `wa pull` and `wa read <own number>`.
 
 1. **Chat-history sync paused on the phone** → fixable. `wa backfill`,
    with WhatsApp foregrounded on the phone for the whole window.
