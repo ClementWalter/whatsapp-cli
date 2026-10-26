@@ -375,7 +375,9 @@ is true of this path (verified live, 2026-10-26):
 - 1:1 chats must be requested by their **phone-number JID**: the phone
   silently ignores a request naming the `@lid` form. `read` uses the
   `lidmap.json` twin first and falls back to the `@lid` form; a 1:1 chat with
-  no known phone number may get no answer at all.
+  no known phone number may get no answer at all. The self chat ("Message
+  yourself") is the exception: the phone answers it only under your own
+  `@lid`, which `read` tries first.
 - The phone sometimes goes quiet for a few minutes mid-walk, then answers
   again. Rerunning the same `read --since` resumes from the oldest cached
   message, so a `no_reply` stop is worth one or two retries a few minutes
@@ -401,7 +403,11 @@ is true of this path (verified live, 2026-10-26):
 contact name → *Export chat* → *Without media*, and save/share the `.txt`
 somewhere readable (Files, Drive, email to self); read that file directly.
 For a handful of messages, forward them to yourself ("Message yourself"),
-then `wa pull` and `wa read <own number>`.
+then `wa pull` and `wa read <own number>`. A forward carries **no pointer to
+its source**: its ContextInfo holds only `isForwarded` and `forwardingScore`
+(no `stanzaID`, `remoteJID`, `participant` or `forwardOrigin`; verified on
+2026-10-26), it gets a new message id, and its timestamp is the time of
+forwarding. Record which chat and date the forwards came from yourself.
 
 1. **Chat-history sync paused on the phone** → fixable. `wa backfill`,
    with WhatsApp foregrounded on the phone for the whole window.

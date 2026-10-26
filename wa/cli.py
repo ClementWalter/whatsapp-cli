@@ -3360,7 +3360,9 @@ async def _extend_chat_once(
             own_lid = JID.parse(device.lid) if device.lid else None
             from wa.cache import load_lidmap
 
-            request_jids = _on_demand_chat_jids(chat_jid, load_lidmap())
+            request_jids = _on_demand_chat_jids(
+                chat_jid, load_lidmap(), own_lid.user if own_lid else ""
+            )
             # Every request sent on this connection: a late answer to an
             # earlier one still re-anchors the walk.
             sent_ids: set[str] = set()
@@ -3455,17 +3457,21 @@ async def _extend_chat_once(
             await session.stop()
 
 
-def _on_demand_chat_jids(chat_jid: str, lidmap: dict[str, str]) -> list[str]:
+def _on_demand_chat_jids(
+    chat_jid: str, lidmap: dict[str, str], own_lid_user: str = ""
+) -> list[str]:
     """Chat JIDs to put in an on-demand request, most likely first.
 
     Phones file 1:1 chats under the phone-number JID and ignore a request
     naming the ``@lid`` form, so an ``@lid`` chat with a known phone-number
-    twin is requested by that twin first.
+    twin is requested by that twin first. The self chat is the exception:
+    the phone answers it only under our own ``@lid``.
     """
     if chat_jid.endswith("@lid"):
-        pn = lidmap.get(chat_jid.split("@")[0])
+        local = chat_jid.split("@")[0]
+        pn = lidmap.get(local)
         if pn:
-            return [pn, chat_jid]
+            return [chat_jid, pn] if local == own_lid_user else [pn, chat_jid]
     return [chat_jid]
 
 
