@@ -14,7 +14,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import secrets
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from typing import Any
 
 from wa.wabinary import JID, Node, decode_node, encode_node
@@ -42,7 +42,8 @@ class InboundSession:
     ``fs`` / ``ns`` are the already-handshaked FrameSocket and Noise
     state. ``device`` supplies the own PN/LID used to classify receipts.
     ``on_message`` is invoked for every ``<message>`` *before* the
-    transport ack — typically ``_try_decrypt_message``.
+    transport ack — typically ``_try_decrypt_message``. It may return
+    extra receipt types (e.g. ``hist_sync``) owed to our own phone.
     """
 
     def __init__(
@@ -51,7 +52,7 @@ class InboundSession:
         ns: Any,
         device: Any,
         *,
-        on_message: Callable[[Node], None] | None = None,
+        on_message: Callable[[Node], Iterable[str] | None] | None = None,
     ) -> None:
         self.fs = fs
         self.ns = ns
@@ -174,13 +175,20 @@ class InboundSession:
             )
             return
         if node.tag == "message":
+            extra: list[str] = []
             if self._on_message is not None:
                 try:
-                    self._on_message(node)
+                    extra = list(self._on_message(node) or ())
                 except Exception as e:
                     log.warning("on_message failed: %s", e)
             await self._ack_stanza(node)
             await self._send_receipt(node)
+            if not self._is_own_echo(node):
+                return
+            if node.attrs.get("category") == "peer":
+                extra.append("peer_msg")
+            for receipt_type in extra:
+                await self._send_protocol_receipt(node, receipt_type)
             return
         if node.tag in ("notification", "call", "receipt"):
             await self._ack_stanza(node)
@@ -219,12 +227,15 @@ class InboundSession:
             ack_attrs["type"] = node.attrs["type"]
         await self.send_node(Node(tag="ack", attrs=ack_attrs))
 
-    async def _send_receipt(self, node: Node) -> None:
+    def _is_own_echo(self, node: Node) -> bool:
         sender = node.attrs.get("participant") or node.attrs.get("from")
-        is_own_echo = isinstance(sender, JID) and sender.user in {
+        return isinstance(sender, JID) and sender.user in {
             self._own_pn.user,
             self._own_lid.user if self._own_lid else None,
         }
+
+    async def _send_receipt(self, node: Node) -> None:
+        is_own_echo = self._is_own_echo(node)
         receipt_attrs = {
             "id": node.attrs.get("id", ""),
             "to": node.attrs.get("from", _SERVER),
@@ -235,6 +246,24 @@ class InboundSession:
         if is_own_echo:
             receipt_attrs["type"] = "sender"
         await self.send_node(Node(tag="receipt", attrs=receipt_attrs))
+
+    async def _send_protocol_receipt(self, node: Node, receipt_type: str) -> None:
+        """Tell our phone a peer/history message was processed.
+
+        The phone tracks ``peer_msg`` and ``hist_sync`` receipts per
+        message id (whatsmeow ``sendProtocolMessageReceipt``); without
+        them it treats its history pushes as undelivered.
+        """
+        await self.send_node(
+            Node(
+                tag="receipt",
+                attrs={
+                    "id": node.attrs.get("id", ""),
+                    "type": receipt_type,
+                    "to": JID(user=self._own_pn.user, server="s.whatsapp.net"),
+                },
+            )
+        )
 
     async def _send_keepalive(self) -> None:
         iq_id = f"ka-{secrets.token_hex(4)}"

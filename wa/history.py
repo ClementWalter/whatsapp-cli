@@ -19,9 +19,8 @@ import hashlib
 import hmac
 import logging
 import zlib
+from collections.abc import Iterable
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 
 from wa.pbutil import decode_fields
 
@@ -102,7 +101,7 @@ def decode_history_sync_notification(hsn_bytes: bytes) -> dict:
     f = decode_fields(hsn_bytes)
 
     def first(tag, default=None):
-        if tag in f and f[tag]:
+        if f.get(tag):
             return f[tag][0]
         return default
 
@@ -117,7 +116,29 @@ def decode_history_sync_notification(hsn_bytes: bytes) -> dict:
         "original_message_id": first(8),
         "progress": first(9),
         "inline_payload": first(11),
+        "request_id": first(12),
     }
+
+
+def history_sync_notification_bytes(message: bytes) -> bytes | None:
+    """Return the ``HistorySyncNotification`` inside a decrypted ``Message``, if any.
+
+    ``Message.protocolMessage`` is field 12 and
+    ``ProtocolMessage.historySyncNotification`` is field 6.
+    """
+    try:
+        protocol = decode_fields(message).get(12, [None])[0]
+        if not isinstance(protocol, (bytes, bytearray)):
+            return None
+        hsn = decode_fields(bytes(protocol)).get(6, [None])[0]
+    except (ValueError, IndexError):  # not a well-formed protobuf
+        return None
+    return bytes(hsn) if isinstance(hsn, (bytes, bytearray)) else None
+
+
+def is_history_sync_notification(message: bytes) -> bool:
+    """True when a decrypted ``Message`` carries a history-sync notification."""
+    return history_sync_notification_bytes(message) is not None
 
 
 def parse_history_sync(payload: bytes) -> dict:

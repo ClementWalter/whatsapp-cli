@@ -13,7 +13,9 @@ import json
 import logging
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
 
@@ -33,6 +35,21 @@ from wa.signal import SignalSession
 from wa.store import DEFAULT_DEVICE_PATH, Device
 from wa.transport.framesocket import FrameSocket
 from wa.wabinary import JID, Node, decode_node, encode_node
+
+if TYPE_CHECKING:
+    from collections.abc import Awaitable, Callable
+
+    from wa.cache import CachedMessage
+
+
+# WhatsApp Web asks for 50 messages per on-demand request; phones serve
+# one HistorySyncNotification per request, so deeper history means paging.
+ON_DEMAND_PAGE = 50
+# Seconds to wait for the phone's reply to one on-demand request; phones
+# routinely take more than a minute.
+ON_DEMAND_REPLY_WAIT = 180.0
+# Upper bound on messages one `read --since` walk may request.
+ON_DEMAND_MAX = 5000
 
 
 def _pretty(node: Node, indent: int = 0) -> str:
@@ -149,12 +166,44 @@ def ingest(download: bool) -> None:
 
     Walks ``~/.cache/whatsapp-cli/blobs/*-protocolMessage-*.bin`` and
     extracts conversations, pushnames, and messages into ``store/`` as
-    JSON / JSONL. Run this once after a fresh ``login`` got the bootstrap
-    history, then read any chat with the ``read`` command.
+    JSON / JSONL. Connecting commands already ingest the history they
+    receive; run this to replay the saved blobs.
+    """
+    pm_files = sorted(_blob_dir().glob("*-protocolMessage-*.bin"))
+    if not pm_files:
+        click.echo(f"no protocolMessage blobs in {_blob_dir()}", err=True)
+        return
+    _ingest_history_blobs(pm_files, download=download)
+
+
+def _blob_dir() -> Path:
+    return Path.home() / ".cache" / "whatsapp-cli" / "blobs"
+
+
+def _blob_ms(path: Path) -> int:
+    """Receive time (epoch ms) encoded as the blob filename's first field."""
+    head = path.name.split("-", 1)[0]
+    return int(head) if head.isdigit() else 0
+
+
+def _history_blobs_since(since_ms: int) -> list[Path]:
+    """protocolMessage blobs saved at or after ``since_ms``, oldest first."""
+    return sorted(
+        p for p in _blob_dir().glob("*-protocolMessage-*.bin") if _blob_ms(p) >= since_ms
+    )
+
+
+def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> int:
+    """Fold the history-sync notifications in ``pm_files`` into the cache.
+
+    CDN-hosted chunks (every ON_DEMAND reply) are only reachable with
+    ``download``; their links expire within days. Returns the number of
+    new messages stored.
     """
     from wa.cache import (
         CachedMessage,
         append_messages,
+        canonical_jid,
         known_message_ids,
         load_chats,
         load_contacts,
@@ -170,12 +219,6 @@ def ingest(download: bool) -> None:
         iter_conversation_messages,
         parse_history_sync,
     )
-
-    blob_dir = Path.home() / ".cache" / "whatsapp-cli" / "blobs"
-    pm_files = sorted(blob_dir.glob("*-protocolMessage-*.bin"))
-    if not pm_files:
-        click.echo(f"no protocolMessage blobs in {blob_dir}", err=True)
-        return
 
     chats = load_chats()
     contacts = load_contacts()
@@ -235,10 +278,14 @@ def ingest(download: bool) -> None:
                 lidmap[local] = pn_jid
                 new_lid += 1
 
+        # Phones file 1:1 history under the phone-number JID; the cache keys
+        # it by the @lid twin like the live path does.
+        lid_of_pn = {pn: lid for lid, pn in lidmap.items()}
         for conv_bytes in hs["conversations"]:
             chat_jid, name, last_ts = conversation_name(conv_bytes)
             if not chat_jid:
                 continue
+            chat_jid = canonical_jid(chat_jid, lidmap_inverted=lid_of_pn)
             if chat_jid not in chats:
                 new_chats += 1
             existing = chats.get(chat_jid, {})
@@ -254,8 +301,8 @@ def ingest(download: bool) -> None:
                 new_messages.append(
                     CachedMessage(
                         ts=m.timestamp,
-                        chat=m.chat_jid,
-                        sender=m.sender_jid,
+                        chat=canonical_jid(m.chat_jid, lidmap_inverted=lid_of_pn),
+                        sender=canonical_jid(m.sender_jid, lidmap_inverted=lid_of_pn),
                         sender_name=m.sender_name,
                         text=m.text,
                         from_me=m.from_me,
@@ -278,6 +325,7 @@ def ingest(download: bool) -> None:
         ),
         err=True,
     )
+    return len(new_messages)
 
 
 @cli.command(name="import-contacts")
@@ -513,19 +561,38 @@ cli.add_command(chats, "chats")
     help="When the query is ambiguous, pick the Nth match (1-based) instead "
     "of the first. Use after seeing the ambiguity list.",
 )
+@click.option(
+    "--since",
+    "since",
+    type=click.DateTime(formats=["%Y-%m-%d"]),
+    default=None,
+    help="Show messages from this date (YYYY-MM-DD) on, paging older history "
+    "from the phone until the cache reaches it. Pair with --limit 0 for all.",
+)
+@click.option(
+    "--wait",
+    "reply_wait",
+    type=float,
+    default=ON_DEMAND_REPLY_WAIT,
+    show_default=True,
+    help="Seconds to wait for the phone's answer to each history request.",
+)
 def read(
     query: str,
     limit: int,
     json_out: bool,
     no_extend: bool,
     match_index: int | None,
+    since,
+    reply_wait: float,
 ) -> None:
     """Show recent messages from a chat (matched by name or JID substring).
 
     Auto-extends: if the local cache has fewer than ``--limit`` messages for
-    the chat, the CLI connects to WhatsApp, asks your phone for more
-    history, ingests the response, and then displays. ``--no-extend`` skips
-    the network round-trip and shows whatever's cached.
+    the chat (or does not reach ``--since``), the CLI connects to WhatsApp,
+    asks your phone for older history 50 messages at a time, ingests each
+    reply, and then displays. ``--no-extend`` skips the network round-trip
+    and shows whatever's cached.
 
     \b
     Examples:
@@ -534,7 +601,13 @@ def read(
       wa read famille --no-extend                 # offline, fast
       wa read alice --match 2                     # pick 2nd of ambiguous matches
       wa read 10000000000000@lid                  # exact JID — never ambiguous
+      wa read alice --since 2022-01-01 --limit 0  # page back to 2022, show all
+
+    The JSON ``coverage`` object (and a stderr note in text mode) states
+    the oldest cached date and why paging stopped, so a short result is
+    never mistaken for the whole chat.
     """
+    since_ts = int(since.timestamp()) if since is not None else None
     from wa.cache import find_chat, iter_messages, load_chats, load_contacts, load_lidmap
 
     matches = find_chat(query)
@@ -571,46 +644,56 @@ def read(
     else:
         chat_jid, chat_info = matches[0]
 
-    # Auto-extend: count cached messages for this chat; if short, fetch more.
-    if not no_extend and limit > 0:
-        cached = sum(1 for m in iter_messages() if m.chat == chat_jid)
-        if cached < limit:
-            need = limit - cached + 5  # margin so next read may not need to refetch
+    # Auto-extend: page older history from the phone while the cache is short
+    # of --limit or does not reach back to --since.
+    rows_all = [m for m in iter_messages() if m.chat == chat_jid]
+    cached = len(rows_all)
+    oldest_ts = min((m.ts for m in rows_all), default=None)
+    want = 0
+    if since_ts is not None and (oldest_ts is None or oldest_ts > since_ts):
+        want = ON_DEMAND_MAX
+    elif limit > 0 and cached < limit:
+        want = limit - cached
+    fetch: PageResult | None = None
+    if not no_extend and want > 0:
+        target = f"back to {_date(since_ts)}" if since_ts is not None else f"{want} more"
+        click.echo(
+            click.style(
+                f"cache has {cached} messages for this chat; asking your phone for {target}...",
+                fg="yellow",
+            ),
+            err=True,
+        )
+        try:
+            from wa.cache import connection_lock
+
+            with connection_lock():
+                fetch = asyncio.run(
+                    _extend_chat(chat_jid, want, since_ts=since_ts, reply_wait=reply_wait)
+                )
             click.echo(
                 click.style(
-                    f"cache has {cached}/{limit}; fetching {need} more from your phone...",
-                    fg="yellow",
+                    f"fetched +{fetch.gained} messages in {fetch.requests} request(s)",
+                    fg="green" if fetch.gained else "yellow",
                 ),
                 err=True,
             )
-            try:
-                from wa.cache import connection_lock
-
-                with connection_lock():
-                    added = asyncio.run(_extend_chat(chat_jid, need))
-                if added > 0:
-                    click.echo(
-                        click.style(f"fetched +{added} new messages", fg="green"),
-                        err=True,
-                    )
-                else:
-                    click.echo(
-                        click.style(
-                            "phone didn't reply — likely chat-history sync is paused on your phone\n"
-                            "  (WhatsApp on phone → Settings → Linked Devices → resume Chat History sync)\n"
-                            "  then run `wa backfill`, which holds a connection open long enough\n"
-                            "  for the phone to push. Note this backfill only ever asks for messages\n"
-                            "  OLDER than the cache, so it cannot fetch recent ones either way.\n"
-                            "  showing what's cached.",
-                            fg="yellow",
-                        ),
-                        err=True,
-                    )
-            except Exception as e:
-                click.echo(
-                    click.style(f"fetch failed (showing cached only): {e}", fg="red"),
-                    err=True,
-                )
+        except Exception as e:
+            click.echo(
+                click.style(f"fetch failed (showing cached only): {e}", fg="red"),
+                err=True,
+            )
+        rows_all = [m for m in iter_messages() if m.chat == chat_jid]
+        oldest_ts = min((m.ts for m in rows_all), default=None)
+    coverage = _coverage(
+        cached=len(rows_all),
+        oldest_ts=oldest_ts,
+        limit=limit,
+        since_ts=since_ts,
+        stop=fetch.stop if fetch else ("skipped" if want > 0 else None),
+    )
+    if coverage.get("note") and not json_out:
+        click.echo(click.style(coverage["note"], fg="yellow"), err=True)
     contacts = load_contacts()
     chats_idx = load_chats()
     lidmap = load_lidmap()
@@ -671,7 +754,7 @@ def read(
         # 5. Pretty phone number (best we can do without an address book).
         return _format_pn(pn_local)
 
-    rows = [m for m in iter_messages() if m.chat == chat_jid]
+    rows = [m for m in rows_all if since_ts is None or m.ts >= since_ts]
     rows.sort(key=lambda m: m.ts)
     rows = rows[-limit:] if limit > 0 else rows
 
@@ -681,6 +764,7 @@ def read(
                 {
                     "chat": chat_jid,
                     "name": chat_info.get("name", ""),
+                    "coverage": coverage,
                     "messages": [
                         {
                             "ts": m.ts,
@@ -1018,6 +1102,7 @@ async def _listen_once(device: Device) -> None:
 
 async def _listen_async(device: Device, exec_cmd: str | None) -> None:
     import subprocess as _sp
+    import time as _time
     from dataclasses import asdict
 
     global MESSAGE_HOOK
@@ -1035,10 +1120,12 @@ async def _listen_async(device: Device, exec_cmd: str | None) -> None:
     backoff = 5.0
     while True:
         started = asyncio.get_event_loop().time()
+        started_ms = int(_time.time() * 1000)
         try:
             await _listen_once(device)
         except (ConnectionError, OSError, asyncio.TimeoutError) as e:
             log.warning("listener connection lost: %s", e)
+        await asyncio.to_thread(_ingest_new_history, started_ms)
         if asyncio.get_event_loop().time() - started > 600:
             backoff = 5.0  # a long, healthy connection resets the backoff
         log.info("reconnecting in %.0fs", backoff)
@@ -2417,15 +2504,21 @@ def _extract_text(plaintext: bytes, _depth: int = 0) -> str:
     return ""
 
 
-def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
+def _try_decrypt_message(node: Node, signal: SignalSession) -> list[str]:
     """Attempt to Signal-decrypt the ``<enc>`` children of a ``<message>``.
 
     For 1:1 ``<message>`` the Signal address is the ``from`` JID. For group
     messages ``from`` is the GROUP JID (``@g.us``) — the real sender is in
     the ``participant`` attribute, and that's who owns the Signal identity
     key we need to authenticate.
+
+    Returns the extra receipt types the message calls for (``hist_sync``
+    for a history-sync notification), which the session sends.
     """
+    from wa.history import is_history_sync_notification
+
     log = logging.getLogger("decrypt")
+    receipts: list[str] = []
     sender = node.attrs.get("participant") or node.attrs.get("from")
     if isinstance(sender, JID):
         jid_user = sender.user
@@ -2436,7 +2529,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
         device_num = int(dev) if dev else 0
     else:
         log.warning("message has no usable from/participant: %s", type(sender))
-        return
+        return receipts
     # For group messages, the <from> JID is the group — we need it to key
     # the sender-key store so skmsg can be decrypted.
     from_jid = node.attrs.get("from")
@@ -2540,6 +2633,8 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                 enc_type, jid_user, device_num, len(ct), e,
             )
             continue
+        if is_history_sync_notification(pt):
+            receipts.append("hist_sync")
         # Map field numbers at the outer Message level to sub-message names
         # from whatsmeow's waE2E.proto (for human-readable log lines).
         _FIELD_NAMES = {
@@ -2672,6 +2767,7 @@ def _try_decrypt_message(node: Node, signal: SignalSession) -> None:
                     p = dump_dir / f"{ts}-{name}-{jid_user}-{device_num}-{idx}-{len(v)}.bin"
                     p.write_bytes(bytes(v))
                     log.debug("saved %d-byte %s → %s", len(v), name, p.name)
+    return receipts
 
 
 async def _fetch_group_participants(
@@ -3052,53 +3148,160 @@ async def _post_success(
     )
 
 
-async def _extend_chat(chat_jid: str, count: int) -> int:
-    """Connect, request more history for ``chat_jid``, ingest, return msg count gained.
+@dataclass
+class PageResult:
+    """Outcome of a paged on-demand walk.
 
-    Sends a ``peerDataOperationRequestMessage`` (Signal-encrypted) to our
-    own phone with the oldest cached message ID for the chat. The phone
-    replies with a fresh ``HistorySyncNotification`` (encrypted peer
-    message) which our standard decrypt+save path captures as a blob, and
-    we then run the existing ingest pipeline on disk.
+    ``stop`` names why it ended: ``count`` (got what was asked), ``since``
+    (reached the target date), ``no_reply`` (the phone stayed silent),
+    ``no_older`` (the phone answered with nothing new: start of the chat
+    on the phone), or ``no_anchor`` (nothing cached to page back from).
     """
-    import secrets
 
+    gained: int = 0
+    requests: int = 0
+    stop: str = "count"
+
+
+async def _page_on_demand(
+    *,
+    oldest: Callable[[], CachedMessage | None],
+    request: Callable[[CachedMessage, int], Awaitable[int | None]],
+    count: int,
+    since_ts: int | None = None,
+    page: int = ON_DEMAND_PAGE,
+) -> PageResult:
+    """Walk a chat's history backwards, one ``page``-sized request at a time.
+
+    ``oldest`` returns the chat's oldest cached message (the anchor);
+    ``request`` asks the phone for ``n`` messages older than it and returns
+    how many new messages landed, or ``None`` when the phone did not reply.
+    Each page re-anchors on the oldest message the previous page stored.
+    """
+    result = PageResult()
+    while result.gained < count:
+        anchor = oldest()
+        if anchor is None:
+            result.stop = "no_anchor"
+            return result
+        if since_ts is not None and anchor.ts <= since_ts:
+            result.stop = "since"
+            return result
+        result.requests += 1
+        got = await request(anchor, min(page, count - result.gained))
+        if got is None:
+            result.stop = "no_reply"
+            return result
+        if got <= 0:
+            result.stop = "no_older"
+            return result
+        result.gained += got
+    result.stop = "count"
+    return result
+
+
+def _oldest_cached(chat_jid: str) -> CachedMessage | None:
     from wa.cache import iter_messages
-    from wa.peerreq import build_peer_data_request, pad_for_signal
 
-    log = logging.getLogger("extend")
+    rows = [m for m in iter_messages() if m.chat == chat_jid]
+    return min(rows, key=lambda m: m.ts) if rows else None
+
+
+def _blob_hsn(path: Path) -> dict | None:
+    """The decoded ``HistorySyncNotification`` in a saved protocolMessage blob."""
+    from wa.history import decode_history_sync_notification
+
+    try:
+        hsn_raw = decode_fields(path.read_bytes()).get(6, [None])[0]
+        if not isinstance(hsn_raw, (bytes, bytearray)):
+            return None
+        return decode_history_sync_notification(bytes(hsn_raw))
+    except (OSError, ValueError, IndexError):  # unreadable or not a protobuf
+        return None
+
+
+def _reply_blobs(paths: list[Path], request_id: str) -> list[Path]:
+    """The saved history-sync notifications that answer ``request_id``.
+
+    The phone echoes the request's message id in
+    ``HistorySyncNotification.peerDataRequestSessionID``.
+    """
+    out = []
+    for p in paths:
+        rid = (_blob_hsn(p) or {}).get("request_id")
+        if isinstance(rid, (bytes, bytearray)) and bytes(rid).decode("utf-8", "replace") == request_id:
+            out.append(p)
+    return out
+
+
+def _ingest_new_history(since_ms: int, skip: set[Path] | frozenset[Path] = frozenset()) -> int:
+    """Download and ingest every history-sync notification saved since ``since_ms``."""
+    files = [
+        p
+        for p in _history_blobs_since(since_ms)
+        if p not in skip and _blob_hsn(p) is not None
+    ]
+    return _ingest_history_blobs(files, download=True) if files else 0
+
+
+async def _extend_chat(
+    chat_jid: str,
+    count: int,
+    *,
+    since_ts: int | None = None,
+    reply_wait: float = ON_DEMAND_REPLY_WAIT,
+) -> PageResult:
+    """Connect once and page older history for ``chat_jid`` from the phone.
+
+    Each page is a ``peerDataOperationRequestMessage`` (HISTORY_SYNC_ON_DEMAND,
+    Signal-encrypted to our own phone) anchored on the oldest cached message.
+    The phone answers with an ON_DEMAND ``HistorySyncNotification`` whose
+    payload sits on the CDN; it is downloaded and ingested before the next
+    page is anchored. Phones often answer minutes late, so replies to
+    earlier requests that land during this connection are ingested too.
+    """
+    import time as _time
 
     device = Device.load()
     if device is None or not device.is_paired():
         raise RuntimeError("no paired device on disk; run `login` first")
-
-    # Find the oldest cached message for this chat to anchor the request.
-    rows = [m for m in iter_messages() if m.chat == chat_jid]
-    if not rows:
+    if _oldest_cached(chat_jid) is None:
         raise RuntimeError(f"no cached messages for {chat_jid}; need an anchor")
-    rows.sort(key=lambda m: m.ts)
-    anchor = rows[0]
 
-    log.info(
-        "anchor: ts=%d id=%s from_me=%s — requesting %d msgs older than this",
-        anchor.ts, anchor.msg_id, anchor.from_me, count,
-    )
+    connected_ms = int(_time.time() * 1000)
+    ingested: set[Path] = set()
+    try:
+        return await _extend_chat_once(
+            device,
+            chat_jid,
+            count,
+            since_ts=since_ts,
+            reply_wait=reply_wait,
+            ingested=ingested,
+        )
+    finally:
+        await asyncio.to_thread(_ingest_new_history, connected_ms, skip=ingested)
 
-    request_plaintext = build_peer_data_request(
-        chat_jid=chat_jid,
-        oldest_msg_id=anchor.msg_id,
-        oldest_ts=anchor.ts,
-        oldest_from_me=anchor.from_me,
-        count=count,
-    )
-    padded = pad_for_signal(request_plaintext)
 
-    blobs_before = _count_blob_files()
+async def _extend_chat_once(
+    device: Device,
+    chat_jid: str,
+    count: int,
+    *,
+    since_ts: int | None,
+    reply_wait: float,
+    ingested: set[Path],
+) -> PageResult:
+    import secrets
+    import time as _time
+
+    from wa.peerreq import build_peer_data_request, pad_for_signal
+
+    log = logging.getLogger("extend")
 
     async with FrameSocket() as fs:
         await fs.connect()
         ns = await do_handshake(fs, device, build_login_payload(device))
-        # Wait for <success/>
         while True:
             ct = await fs.recv(timeout=15.0)
             node = decode_node(ns.decrypt_frame(ct))
@@ -3125,67 +3328,162 @@ async def _extend_chat(chat_jid: str, count: int) -> int:
                 log.debug("active IQ unconfirmed")
             await _send_presence_available(fs, ns, device)
 
-            # Encrypt to our own *LID* device 0 (whatsmeow does the same — peer
-            # messages go to the LID identity, even though the wire-level `to`
-            # attribute is the PN form). Two session entries exist in our store:
-            # the PN-keyed one and the LID-keyed one. We pick LID per the
-            # whatsmeow reference.
             own_pn = JID.parse(device.jid)
             own_lid = JID.parse(device.lid) if device.lid else None
-            if own_lid is not None:
-                ciphertext, kind = signal.encrypt_msg(own_lid.user, 0, padded)
-            else:
-                ciphertext, kind = signal.encrypt_msg(own_pn.user, 0, padded)
-            peer_msg = Node(
-                tag="message",
-                attrs={
-                    "to": JID(user=own_pn.user, server="s.whatsapp.net"),
-                    "category": "peer",
-                    "type": "text",
-                    # WhatsApp message IDs are uppercase hex of length 22 prefixed
-                    # with 3EB0 for outgoing client-generated. The server filters
-                    # off-format IDs from peer routing.
-                    "id": "3EB0" + secrets.token_hex(9).upper(),
-                    # On-demand history requests need these flags or the phone
-                    # quietly drops them (per whatsmeow preparePeerMessageNode).
-                    "push_priority": "high_force",
-                    "privacy_sensitive": "1",
-                },
-                content=[
+            from wa.cache import load_lidmap
+
+            request_jids = _on_demand_chat_jids(chat_jid, load_lidmap())
+
+            async def request(anchor: CachedMessage, n: int) -> int | None:
+                log.info(
+                    "anchor: %s id=%s from_me=%s — requesting %d older messages",
+                    _date(anchor.ts), anchor.msg_id, anchor.from_me, n,
+                )
+                for request_jid in list(request_jids):
+                    got = await send_and_wait(request_jid, anchor, n)
+                    if got is not None:
+                        # Later pages go straight to the form the phone answered.
+                        request_jids.remove(request_jid)
+                        request_jids.insert(0, request_jid)
+                        return got
+                return None
+
+            async def send_and_wait(
+                request_jid: str, anchor: CachedMessage, n: int
+            ) -> int | None:
+                padded = pad_for_signal(
+                    build_peer_data_request(
+                        chat_jid=request_jid,
+                        oldest_msg_id=anchor.msg_id,
+                        oldest_ts=anchor.ts,
+                        oldest_from_me=anchor.from_me,
+                        count=n,
+                    )
+                )
+                # Peer messages are encrypted to our own LID identity while
+                # the wire `to` stays the PN form (whatsmeow
+                # preparePeerMessageNode).
+                if own_lid is not None:
+                    ciphertext, kind = signal.encrypt_msg(own_lid.user, 0, padded)
+                else:
+                    ciphertext, kind = signal.encrypt_msg(own_pn.user, 0, padded)
+                content = [
                     Node(tag="meta", attrs={"appdata": "default"}),
                     Node(tag="enc", attrs={"v": "2", "type": kind}, content=ciphertext),
-                ],
+                ]
+                if kind == "pkmsg":
+                    # A prekey message without our signed device identity is
+                    # undecryptable for the phone.
+                    content.append(Node(tag="device-identity", content=device.account))
+                request_id = "3EB0" + secrets.token_hex(9).upper()
+                started_ms = int(_time.time() * 1000)
+                await session.send_node(
+                    Node(
+                        tag="message",
+                        attrs={
+                            "to": JID(user=own_pn.user, server="s.whatsapp.net"),
+                            "category": "peer",
+                            "type": "text",
+                            "id": request_id,
+                            "push_priority": "high_force",
+                            "privacy_sensitive": "1",
+                        },
+                        content=content,
+                    )
+                )
+                log.info(
+                    "on-demand request %s for %s sent (%s); waiting %.0fs",
+                    request_id, request_jid, kind, reply_wait,
+                )
+                deadline = _time.monotonic() + reply_wait
+                replies: list[Path] = []
+                while _time.monotonic() < deadline and not session.disconnected:
+                    replies = _reply_blobs(_history_blobs_since(started_ms), request_id)
+                    if replies:
+                        break
+                    await asyncio.sleep(0.5)
+                if not replies:
+                    log.info("no reply to %s", request_id)
+                    return None
+                ingested.update(replies)
+                return await asyncio.to_thread(_ingest_history_blobs, replies, download=True)
+
+            return await _page_on_demand(
+                oldest=lambda: _oldest_cached(chat_jid),
+                request=request,
+                count=count,
+                since_ts=since_ts,
             )
-            await session.send_node(peer_msg)
-            log.info("on-demand request sent (%s, %d-byte payload)", kind, len(ciphertext))
-            log.info("listening for history reply (60s)...")
-            await session.drain(seconds=60.0, idle=60.0)
         finally:
             await session.stop()
 
-    # Now process any new blobs into the cache.
-    blobs_after = _count_blob_files()
-    log.info("blobs delta: %d → %d", blobs_before, blobs_after)
-    return await _ingest_now(chat_jid)
+
+def _on_demand_chat_jids(chat_jid: str, lidmap: dict[str, str]) -> list[str]:
+    """Chat JIDs to put in an on-demand request, most likely first.
+
+    Phones file 1:1 chats under the phone-number JID and ignore a request
+    naming the ``@lid`` form, so an ``@lid`` chat with a known phone-number
+    twin is requested by that twin first.
+    """
+    if chat_jid.endswith("@lid"):
+        pn = lidmap.get(chat_jid.split("@")[0])
+        if pn:
+            return [pn, chat_jid]
+    return [chat_jid]
 
 
-def _count_blob_files() -> int:
-    p = Path.home() / ".cache" / "whatsapp-cli" / "blobs"
-    if not p.exists():
-        return 0
-    return sum(1 for _ in p.iterdir() if _.is_file())
+_STOP_REASONS = {
+    "no_reply": "your phone did not answer the history request (WhatsApp must be "
+    "open in the foreground on the phone; retry, or see SKILL.md "
+    "'Recovering missing messages')",
+    "no_older": "your phone has nothing older for this chat",
+    "no_anchor": "nothing is cached for this chat to page back from",
+    "skipped": "--no-extend skipped asking the phone",
+    "count": "",
+    "since": "",
+}
 
 
-async def _ingest_now(chat_jid: str) -> int:
-    """Run ingest in-process and return how many new messages landed for chat_jid."""
-    from wa.cache import iter_messages
+def _coverage(
+    *,
+    cached: int,
+    oldest_ts: int | None,
+    limit: int,
+    since_ts: int | None,
+    stop: str | None,
+) -> dict:
+    """Describe how far back the local cache reaches for one chat.
 
-    before = sum(1 for m in iter_messages() if m.chat == chat_jid)
-    # Re-use the ingest CLI command body via a direct call. The command is
-    # decorated with @cli.command(), but its callback is accessible.
-    ingest.callback(download=False)  # type: ignore[attr-defined]
-    after = sum(1 for m in iter_messages() if m.chat == chat_jid)
-    return after - before
+    ``note`` is set whenever the cache holds less than was asked for, so a
+    reader cannot take a short result for the whole conversation.
+    """
+    short = (limit > 0 and cached < limit) or (
+        since_ts is not None and (oldest_ts is None or oldest_ts > since_ts)
+    )
+    out: dict = {
+        "cached": cached,
+        "oldest_ts": oldest_ts,
+        "oldest_date": _date(oldest_ts) if oldest_ts is not None else None,
+        "stop": stop,
+        "complete": stop == "no_older",
+        "note": None,
+    }
+    if short and stop != "no_older":
+        start = out["oldest_date"] or "nowhere (empty)"
+        reason = _STOP_REASONS.get(stop or "", "")
+        out["note"] = (
+            f"PARTIAL: the local cache for this chat starts at {start} "
+            f"({cached} messages)"
+            + (f"; {reason}" if reason else "")
+            + ". Older messages may exist only on the phone."
+        )
+    return out
+
+
+def _date(ts: int) -> str:
+    from datetime import datetime
+
+    return datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
 
 
 async def _login_handshake(
@@ -3200,8 +3498,27 @@ async def _login_handshake(
     The phone's Linked Devices dialog only closes once this step completes
     against the server; it's also the normal startup path for an already-
     paired device. ``seconds``, ``idle``, and ``fetch_groups`` forward to
-    :func:`_post_success` for the post-auth drain phase.
+    :func:`_post_success` for the post-auth drain phase. History the phone
+    pushed during the connection is downloaded and ingested on the way out.
     """
+    import time as _time
+
+    started_ms = int(_time.time() * 1000)
+    try:
+        await _login_handshake_once(
+            device, seconds=seconds, idle=idle, fetch_groups=fetch_groups
+        )
+    finally:
+        await asyncio.to_thread(_ingest_new_history, started_ms)
+
+
+async def _login_handshake_once(
+    device: Device,
+    *,
+    seconds: float,
+    idle: float,
+    fetch_groups: bool,
+) -> None:
     async with FrameSocket() as fs:
         await fs.connect()
         try:
