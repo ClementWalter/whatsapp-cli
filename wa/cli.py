@@ -3220,8 +3220,8 @@ def _blob_hsn(path: Path) -> dict | None:
         return None
 
 
-def _reply_blobs(paths: list[Path], request_id: str) -> list[Path]:
-    """The saved history-sync notifications that answer ``request_id``.
+def _reply_blobs(paths: list[Path], request_ids: set[str]) -> list[Path]:
+    """The saved history-sync notifications that answer one of ``request_ids``.
 
     The phone echoes the request's message id in
     ``HistorySyncNotification.peerDataRequestSessionID``.
@@ -3229,7 +3229,7 @@ def _reply_blobs(paths: list[Path], request_id: str) -> list[Path]:
     out = []
     for p in paths:
         rid = (_blob_hsn(p) or {}).get("request_id")
-        if isinstance(rid, (bytes, bytearray)) and bytes(rid).decode("utf-8", "replace") == request_id:
+        if isinstance(rid, (bytes, bytearray)) and bytes(rid).decode("utf-8", "replace") in request_ids:
             out.append(p)
     return out
 
@@ -3278,6 +3278,7 @@ async def _extend_chat(
             since_ts=since_ts,
             reply_wait=reply_wait,
             ingested=ingested,
+            connected_ms=connected_ms,
         )
     finally:
         await asyncio.to_thread(_ingest_new_history, connected_ms, skip=ingested)
@@ -3291,6 +3292,7 @@ async def _extend_chat_once(
     since_ts: int | None,
     reply_wait: float,
     ingested: set[Path],
+    connected_ms: int,
 ) -> PageResult:
     import secrets
     import time as _time
@@ -3333,6 +3335,9 @@ async def _extend_chat_once(
             from wa.cache import load_lidmap
 
             request_jids = _on_demand_chat_jids(chat_jid, load_lidmap())
+            # Every request sent on this connection: a late answer to an
+            # earlier one still re-anchors the walk.
+            sent_ids: set[str] = set()
 
             async def request(anchor: CachedMessage, n: int) -> int | None:
                 log.info(
@@ -3376,7 +3381,7 @@ async def _extend_chat_once(
                     # undecryptable for the phone.
                     content.append(Node(tag="device-identity", content=device.account))
                 request_id = "3EB0" + secrets.token_hex(9).upper()
-                started_ms = int(_time.time() * 1000)
+                sent_ids.add(request_id)
                 await session.send_node(
                     Node(
                         tag="message",
@@ -3398,7 +3403,11 @@ async def _extend_chat_once(
                 deadline = _time.monotonic() + reply_wait
                 replies: list[Path] = []
                 while _time.monotonic() < deadline and not session.disconnected:
-                    replies = _reply_blobs(_history_blobs_since(started_ms), request_id)
+                    replies = [
+                        p
+                        for p in _reply_blobs(_history_blobs_since(connected_ms), sent_ids)
+                        if p not in ingested
+                    ]
                     if replies:
                         break
                     await asyncio.sleep(0.5)
