@@ -385,11 +385,17 @@ is true of this path (verified live, 2026-10-26):
   `1` = the chat really starts here (`no_older`, `complete: true`);
   `3` = **older messages exist on the phone but it will not serve them to a
   linked device** (`no_access`). Type 3 is a hard phone-side cutoff, not
-  sleep: on 2026-10-26 one 1:1 chat stopped at 2023-05-15 with type 3
-  on every retry while the phone was awake and answering, although the user
-  could read (and forward) 2022 messages of that chat on the phone. Retrying,
-  changing the anchor, or flipping the JID form does not move it. For
-  `no_access`, go straight to the fallback below.
+  sleep. Retrying, changing the anchor, or flipping the JID form does not
+  move it. For `no_access`, go straight to the fallback below.
+- **Undecryptable placeholders block the walk.** Messages the phone itself
+  never decrypted (the "Waiting for this message" bubbles, `messageStubType`
+  CIPHERTEXT) are served as `[waiting for this message]` rows. The phone
+  answers type 3 for any request anchored on the oldest of a run of them,
+  whatever id or timestamp is sent, so nothing older than the placeholders
+  can be paged in. `coverage` marks such a chat as never `complete` and says
+  so in its `note`. Verified on 2026-10-26: one 1:1 chat stops at six
+  2023-05-15 placeholders (msgOrderID 292, so about 291 older messages
+  exist on the phone, back to 2022).
 
 **Fallback when the phone will not serve it:** on the phone, open the chat →
 contact name → *Export chat* → *Without media*, and save/share the `.txt`

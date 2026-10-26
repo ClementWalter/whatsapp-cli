@@ -18,9 +18,12 @@ from wa.history import (
     END_COMPLETE_NOTHING_MORE,
     END_ON_DEMAND_MORE_ON_PRIMARY,
     END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS,
+    PLACEHOLDER_TEXT,
+    STUB_CIPHERTEXT,
     conversation_end_type,
     decode_history_sync_notification,
     is_history_sync_notification,
+    iter_conversation_messages,
 )
 from wa.peerreq import _length_delim, _string_field, _varint_field
 from wa.session import InboundSession
@@ -510,3 +513,53 @@ def test_refusal_note_says_older_messages_exist_on_the_phone():
 
 def test_refusal_is_not_complete():
     assert _coverage(stop="no_access")["complete"] is False
+
+
+# --- undecryptable placeholders ---------------------------------------------
+
+
+def _history_conversation(stub_type: int | None) -> bytes:
+    """Conversation with one HistorySyncMsg whose WebMessageInfo has no body."""
+    key = _string_field(1, PN_CHAT) + _varint_field(2, 1) + _string_field(3, "3EB02742")
+    wmi = _length_delim(1, key) + _varint_field(3, 1684164883)
+    if stub_type is not None:
+        wmi += _varint_field(24, stub_type)
+    return _string_field(1, PN_CHAT) + _length_delim(2, _length_delim(1, wmi))
+
+
+def test_ciphertext_stub_is_rendered_as_a_placeholder():
+    (msg,) = iter_conversation_messages(_history_conversation(STUB_CIPHERTEXT))
+    assert msg.text == PLACEHOLDER_TEXT
+
+
+def test_bodiless_message_without_stub_stays_empty():
+    (msg,) = iter_conversation_messages(_history_conversation(None))
+    assert msg.text == ""
+
+
+@pytest.mark.parametrize(
+    ("texts", "expected"),
+    [
+        ([PLACEHOLDER_TEXT, "hello"], True),
+        (["hello", PLACEHOLDER_TEXT], False),
+        ([], False),
+    ],
+    ids=["oldest-is-placeholder", "newer-placeholder", "empty"],
+)
+def test_oldest_is_placeholder(texts, expected):
+    rows = [
+        CachedMessage(
+            ts=i, chat=LID_CHAT, sender="", sender_name="", text=t, from_me=False
+        )
+        for i, t in enumerate(texts)
+    ]
+    assert cli._oldest_is_placeholder(rows) is expected
+
+
+def test_start_of_chat_behind_placeholders_is_not_complete():
+    assert _coverage(stop="no_older", oldest_is_placeholder=True)["complete"] is False
+
+
+def test_placeholder_note_names_the_placeholders():
+    note = _coverage(stop="no_access", oldest_is_placeholder=True)["note"]
+    assert "Waiting for this message" in note

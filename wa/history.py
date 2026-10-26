@@ -204,6 +204,12 @@ END_ON_DEMAND_MORE_ON_PRIMARY = 2
 END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS = 3
 
 
+# WebMessageInfo.messageStubType CIPHERTEXT: the phone never decrypted the
+# message and shows "Waiting for this message" in its place.
+STUB_CIPHERTEXT = 2
+PLACEHOLDER_TEXT = "[waiting for this message]"
+
+
 def conversation_end_type(conv_bytes: bytes) -> int | None:
     """``Conversation.endOfHistoryTransferType`` (field 11), if the phone set it.
 
@@ -253,6 +259,7 @@ def iter_conversation_messages(conv_bytes: bytes) -> Iterable[HistoryMessage]:
          messageTimestamp=3  (uint64)
          participant=5       (string — same value as key.participant in groups)
          pushName=19         (string — sender display name at time of msg)
+         messageStubType=24  (enum — CIPHERTEXT rows become PLACEHOLDER_TEXT)
     """
     chat_id = conversation_name(conv_bytes)[0]
     conv = decode_fields(conv_bytes)
@@ -297,6 +304,8 @@ def iter_conversation_messages(conv_bytes: bytes) -> Iterable[HistoryMessage]:
             text = _extract_text(bytes(wmi[2][0]))
             quoted_id = extract_quoted_id(bytes(wmi[2][0]))
             media = extract_media(bytes(wmi[2][0]))
+        if not text and wmi.get(24, [None])[0] == STUB_CIPHERTEXT:
+            text = PLACEHOLDER_TEXT
 
         yield HistoryMessage(
             chat_jid=chat_id,
