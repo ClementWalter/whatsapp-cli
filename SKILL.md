@@ -375,8 +375,13 @@ is true of this path (verified live, 2026-10-26):
   silently ignores a request naming the `@lid` form. `read` uses the
   `lidmap.json` twin first and falls back to the `@lid` form; a 1:1 chat with
   no known phone number may get no answer at all.
-- `coverage.stop == "no_reply"` with WhatsApp foregrounded on the phone, after
-  a retry, means this path is exhausted for that chat.
+- The phone sometimes goes quiet for a few minutes mid-walk, then answers
+  again. Rerunning the same `read --since` resumes from the oldest cached
+  message, so a `no_reply` stop is worth one or two retries a few minutes
+  apart, with WhatsApp foregrounded.
+- An empty answer (`stop: "no_older"`, `complete: true`) means the phone's own
+  copy of that chat starts there. Anything older is not on the phone under
+  that chat: look for it in another chat (an old number, a group) or a backup.
 
 **Fallback when the phone will not serve it:** on the phone, open the chat →
 contact name → *Export chat* → *Without media*, and save/share the `.txt`

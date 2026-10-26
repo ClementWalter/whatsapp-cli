@@ -78,12 +78,17 @@ def test_notification_exposes_request_id():
 
 def test_reply_blob_matches_its_request_id(blob_dir):
     path = _save_blob(blob_dir, 1000, _protocol_message(_hsn("3EB0AAA")))
-    assert cli._reply_blobs([path], "3EB0AAA") == [path]
+    assert cli._reply_blobs([path], {"3EB0AAA"}) == [path]
+
+
+def test_late_reply_to_an_earlier_request_matches(blob_dir):
+    path = _save_blob(blob_dir, 1000, _protocol_message(_hsn("3EB0OLD")))
+    assert cli._reply_blobs([path], {"3EB0OLD", "3EB0NEW"}) == [path]
 
 
 def test_reply_blob_for_another_request_is_ignored(blob_dir):
     path = _save_blob(blob_dir, 1000, _protocol_message(_hsn("3EB0BBB")))
-    assert cli._reply_blobs([path], "3EB0AAA") == []
+    assert cli._reply_blobs([path], {"3EB0AAA"}) == []
 
 
 def test_blobs_saved_before_the_cutoff_are_skipped(blob_dir):
