@@ -701,6 +701,7 @@ def read(
         limit=limit,
         since_ts=since_ts,
         stop=fetch.stop if fetch else ("skipped" if want > 0 else None),
+        oldest_is_placeholder=_oldest_is_placeholder(rows_all),
     )
     if coverage.get("note") and not json_out:
         click.echo(click.style(coverage["note"], fg="yellow"), err=True)
@@ -3468,6 +3469,13 @@ def _on_demand_chat_jids(chat_jid: str, lidmap: dict[str, str]) -> list[str]:
     return [chat_jid]
 
 
+def _oldest_is_placeholder(rows: list[CachedMessage]) -> bool:
+    """True when the chat's oldest cached message is a CIPHERTEXT placeholder."""
+    from wa.history import PLACEHOLDER_TEXT
+
+    return bool(rows) and min(rows, key=lambda m: m.ts).text == PLACEHOLDER_TEXT
+
+
 _STOP_REASONS = {
     "no_reply": "your phone did not answer the history request (WhatsApp must be "
     "open in the foreground on the phone; retry, or see SKILL.md "
@@ -3493,11 +3501,15 @@ def _coverage(
     limit: int,
     since_ts: int | None,
     stop: str | None,
+    oldest_is_placeholder: bool = False,
 ) -> dict:
     """Describe how far back the local cache reaches for one chat.
 
     ``note`` is set whenever the cache holds less than was asked for, so a
-    reader cannot take a short result for the whole conversation.
+    reader cannot take a short result for the whole conversation. A chat
+    whose oldest cached rows are undecryptable placeholders is never
+    complete: phones stop serving history at them while older messages
+    remain on the phone.
     """
     short = (limit > 0 and cached < limit) or (
         since_ts is not None and (oldest_ts is None or oldest_ts > since_ts)
@@ -3507,16 +3519,22 @@ def _coverage(
         "oldest_ts": oldest_ts,
         "oldest_date": _date(oldest_ts) if oldest_ts is not None else None,
         "stop": stop,
-        "complete": stop == "no_older",
+        "complete": stop == "no_older" and not oldest_is_placeholder,
         "note": None,
     }
-    if short and stop != "no_older":
+    if short and not out["complete"]:
         start = out["oldest_date"] or "nowhere (empty)"
         reason = _STOP_REASONS.get(stop or "", "")
         out["note"] = (
             f"PARTIAL: the local cache for this chat starts at {start} "
             f"({cached} messages)"
             + (f"; {reason}" if reason else "")
+            + (
+                "; its oldest rows are 'Waiting for this message' placeholders the "
+                "phone never decrypted, and it will not page past them"
+                if oldest_is_placeholder
+                else ""
+            )
             + ". Older messages may exist only on the phone."
         )
     return out
