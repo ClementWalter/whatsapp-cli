@@ -197,6 +197,25 @@ def parse_history_sync(payload: bytes) -> dict:
     }
 
 
+# Conversation.endOfHistoryTransferType values (waHistorySync.proto).
+END_COMPLETE_MORE_ON_PRIMARY = 0
+END_COMPLETE_NOTHING_MORE = 1
+END_ON_DEMAND_MORE_ON_PRIMARY = 2
+END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS = 3
+
+
+def conversation_end_type(conv_bytes: bytes) -> int | None:
+    """``Conversation.endOfHistoryTransferType`` (field 11), if the phone set it.
+
+    It is the phone's verdict on what lies before the oldest message it
+    sent: ``END_COMPLETE_NOTHING_MORE`` is the true start of the chat;
+    ``END_ON_DEMAND_MORE_ON_PRIMARY_NO_ACCESS`` means older messages exist
+    on the phone but it will not serve them to a linked device.
+    """
+    value = decode_fields(conv_bytes).get(11, [None])[0]
+    return value if isinstance(value, int) else None
+
+
 def conversation_name(conv_bytes: bytes) -> tuple[str, str, int]:
     """Return ``(chat_jid, name, last_msg_timestamp)`` from a Conversation proto."""
     conv = decode_fields(conv_bytes)
