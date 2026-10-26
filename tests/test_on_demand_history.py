@@ -563,3 +563,11 @@ def test_start_of_chat_behind_placeholders_is_not_complete():
 def test_placeholder_note_names_the_placeholders():
     note = _coverage(stop="no_access", oldest_is_placeholder=True)["note"]
     assert "Waiting for this message" in note
+
+
+def test_self_chat_is_requested_by_its_lid_first():
+    lidmap = {"10000000000000": "33612345678@s.whatsapp.net"}
+    assert cli._on_demand_chat_jids("10000000000000@lid", lidmap, "10000000000000") == [
+        "10000000000000@lid",
+        "33612345678@s.whatsapp.net",
+    ]
