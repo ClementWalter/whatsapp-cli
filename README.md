@@ -1,5 +1,7 @@
 # WhatsApp & Signal CLI
 
+**Visibility: public.**
+
 Read and send your personal **WhatsApp and Signal messages from the terminal**.
 One repository, two commands, separate linked-device accounts and local stores:
 

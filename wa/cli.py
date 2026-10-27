@@ -147,7 +147,7 @@ def _setup_logging(debug: bool) -> None:
     )
 
 
-@click.group()
+@click.group(epilog="\b\nExamples:\n  wa list --limit 10\n  wa read alice --json\n  wa send 33612345678@s.whatsapp.net \"hi\"")
 @click.option("--debug", is_flag=True, help="Verbose logging")
 @click.pass_context
 def cli(ctx: click.Context, debug: bool) -> None:
@@ -155,7 +155,7 @@ def cli(ctx: click.Context, debug: bool) -> None:
     ctx.ensure_object(dict)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa ingest\n  wa ingest --download")
 @click.option(
     "--download",
     is_flag=True,
@@ -338,7 +338,7 @@ def _ingest_history_blobs(pm_files: list[Path], *, download: bool) -> HistoryIng
     return HistoryIngest(added=len(new_messages), end_types=end_types)
 
 
-@cli.command(name="import-contacts")
+@cli.command(name="import-contacts", epilog="\b\nExamples:\n  wa import-contacts")
 def import_contacts_cmd() -> None:
     """Pull names from macOS Contacts.app and merge into the local cache.
 
@@ -364,7 +364,7 @@ def import_contacts_cmd() -> None:
     click.echo(click.style(f"merged {new_count} new names into contacts", fg="green"), err=True)
 
 
-@cli.command(name="migrate")
+@cli.command(name="migrate", epilog="\b\nExamples:\n  wa migrate --dry-run\n  wa migrate")
 @click.option(
     "--dry-run",
     is_flag=True,
@@ -501,7 +501,7 @@ def migrate_cmd(dry_run: bool) -> None:
     click.echo(click.style("done.\n", fg="green") + summary)
 
 
-@cli.command("list")
+@cli.command("list", epilog="\b\nExamples:\n  wa list --limit 10\n  wa chats --json")
 @click.option("--limit", type=int, default=20, help="Max chats to show")
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
 def chats(limit: int, json_out: bool) -> None:
@@ -554,7 +554,7 @@ def chats(limit: int, json_out: bool) -> None:
 cli.add_command(chats, "chats")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa read alice\n  wa read 33612345678 --limit 50 --json\n  wa read alice --no-extend                    # offline, fast\n  wa read alice --match 2                      # pick 2nd of ambiguous matches\n  wa read 10000000000000@lid                   # exact JID, never ambiguous\n  wa read alice --since 2022-01-01 --limit 0   # page back to 2022, show all")
 @click.argument("query")
 @click.option("--limit", type=int, default=20, help="Max messages to show")
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
@@ -603,15 +603,6 @@ def read(
     asks your phone for older history 50 messages at a time, ingests each
     reply, and then displays. ``--no-extend`` skips the network round-trip
     and shows whatever's cached.
-
-    \b
-    Examples:
-      wa read famille
-      wa read 33123456789 --limit 50 --json
-      wa read famille --no-extend                 # offline, fast
-      wa read alice --match 2                     # pick 2nd of ambiguous matches
-      wa read 16677492244589@lid                  # exact JID — never ambiguous
-      wa read alice --since 2022-01-01 --limit 0  # page back to 2022, show all
 
     The JSON ``coverage`` object (and a stderr note in text mode) states
     the oldest cached date and why paging stopped, so a short result is
@@ -728,7 +719,7 @@ def read(
     def _format_pn(pn_local: str) -> str:
         """Render a phone-number local part as a tappable-ish display.
 
-        ``33608652084`` → ``+33 6 08 65 20 84``. Falls back to ``+<digits>``
+        ``33612345678`` → ``+33 6 12 34 56 78``. Falls back to ``+<digits>``
         for non-French numbers. Better than a 15-digit LID for the eye.
         """
         if not pn_local.isdigit():
@@ -813,7 +804,7 @@ def read(
         click.echo(f"{ts}  {who}: {text}")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa download 3EB0123456789ABCDEF0 -o ~/Downloads/")
 @click.argument("msg_id")
 @click.option("-o", "--output", "output", type=click.Path(dir_okay=True), default=None, help="File or directory to write to (default: ./<msg_id><ext>).")
 def download(msg_id: str, output: str | None) -> None:
@@ -844,7 +835,7 @@ def download(msg_id: str, output: str | None) -> None:
     click.echo(str(target))
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa status")
 def status() -> None:
     """Show whether we have a paired device on disk."""
     dev = Device.load()
@@ -880,7 +871,7 @@ def status() -> None:
         click.echo("last sync: never — run `wa pull`")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa login\n  wa login --reset")
 @click.option(
     "--reset", is_flag=True, help="Discard any existing device state and start fresh"
 )
@@ -897,7 +888,7 @@ def login(reset: bool) -> None:
         asyncio.run(_login_async(dev))
 
 
-@cli.command("pull")
+@cli.command("pull", epilog="\b\nExamples:\n  wa pull\n  wa sync --idle 5 --refresh-groups")
 @click.option(
     "--seconds",
     type=float,
@@ -949,7 +940,7 @@ def sync(seconds: float, idle: float, refresh_groups: bool) -> None:
 cli.add_command(sync, "sync")
 
 
-@cli.command("backfill")
+@cli.command("backfill", epilog="\b\nExamples:\n  wa backfill\n  wa history --minutes 5")
 @click.option(
     "--minutes",
     type=float,
@@ -1144,7 +1135,7 @@ async def _listen_async(device: Device, exec_cmd: str | None) -> None:
         backoff = min(backoff * 2, 300.0)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa listen\n  wa listen --exec 'jq -r .text'")
 @click.option("--exec", "exec_cmd", default=None, help="Shell command run for each received message, its JSON on stdin (e.g. an inbox trigger).")
 def listen(exec_cmd: str | None) -> None:
     """Stay connected and stream every received message as a JSON line, reconnecting when dropped.
@@ -1167,7 +1158,7 @@ def listen(exec_cmd: str | None) -> None:
             pass
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  wa send 33612345678@s.whatsapp.net \"test from CLI\"   # explicit, safe\n  wa send alice \"hi\"\n  wa send alice --doc report.pdf                        # document, no caption\n  wa send alice \"see attached\" --doc report.pdf         # document + caption")
 @click.argument("peer")
 @click.argument("text", required=False, default="")
 @click.option(
@@ -1212,13 +1203,6 @@ def send(peer: str, text: str, doc_path: str | None, no_thumbnail: bool, reply_t
         pick that group over the contact;
       * to message yourself use ``<number>@s.whatsapp.net`` — the bare number
         does not reach your own DM, which is keyed by a digit-less ``@lid``.
-
-    \b
-    Examples:
-      wa send 33123456789@s.whatsapp.net "test from CLI"   # explicit, safe
-      wa send pierre "hi"
-      wa send pierre --doc report.pdf                       # document, no caption
-      wa send pierre "see attached" --doc report.pdf        # document + caption
     """
     dev = Device.load()
     if dev is None or not dev.is_paired():
@@ -3628,7 +3612,7 @@ async def _login_handshake_once(
             )
 
 
-@cli.command("auth-status")
+@cli.command("auth-status", epilog="\b\nExamples:\n  wa auth-status\n  wa auth-status --json")
 @click.option("--json", "as_json", is_flag=True, help="Emit secret-free metadata.")
 def auth_status(as_json):
     """Inspect this host's pairing. Example: auth-status --json."""
@@ -3642,16 +3626,12 @@ def auth_status(as_json):
     }))
 
 
-@cli.command("auth-sync")
+@cli.command("auth-sync", epilog="\b\nExamples:\n  wa auth-sync")
 def auth_sync():
     """Report device-local storage without cloning keys. Example: auth-sync."""
     click.echo(json.dumps({"connector": "whatsapp", "source": "host-local", "portable": False,
                           "reason": "Each host requires independent device pairing; active keys cannot be synchronized."}))
 
-
-# Provider commands share the same execution policy as the app and MCP.
-from .onebrain_policy import install as _install_onebrain_policy
-_install_onebrain_policy(cli, 'whatsapp')
 
 if __name__ == "__main__":
     cli()

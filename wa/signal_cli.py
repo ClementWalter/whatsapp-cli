@@ -261,7 +261,7 @@ def emit(value, as_json: bool) -> None:
         click.echo(json.dumps(value, ensure_ascii=False))
 
 
-@click.group()
+@click.group(epilog="\b\nExamples:\n  signal-cli status\n  signal-cli list --json\n  signal-cli read Alice --limit 20")
 @click.option(
     "--account", envvar="SIGNAL_ACCOUNT", help="Linked account number or UUID."
 )
@@ -279,7 +279,7 @@ def cli(ctx, account, data_dir):
     ctx.obj = Client(data_dir, account)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli setup")
 def setup():
     """Install the official crypto library. Example: signal-cli setup."""
     node = node_runtime()
@@ -301,7 +301,7 @@ def setup():
         raise click.ClickException("Official libsignal installation failed.")
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli login\n  signal-cli login --name laptop")
 @click.option("--name", default="personal-cli", show_default=True)
 @click.option(
     "--history/--no-history", default=True, help="Request phone history during pairing."
@@ -351,7 +351,7 @@ def login(client, name, history, as_json, qr_file):
             raise
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli status --json")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def status(client, as_json):
@@ -359,7 +359,7 @@ def status(client, as_json):
     emit(client.run("listAccounts", account=False), as_json)
 
 
-@cli.command("list")
+@cli.command("list", epilog="\b\nExamples:\n  signal-cli list\n  signal-cli chats --json --limit 50")
 @click.option("--json", "as_json", is_flag=True)
 @click.option("--limit", type=click.IntRange(min=1), default=20)
 @click.pass_obj
@@ -369,7 +369,7 @@ def list_chats(client, as_json, limit):
     emit(sorted(client.peers(), key=lambda peer: not peer["group"])[:limit], as_json)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli pull\n  signal-cli sync --seconds 10 --json")
 @click.option("--seconds", type=click.IntRange(1, 60), default=5, show_default=True)
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
@@ -379,7 +379,7 @@ def pull(client, seconds, as_json):
     emit(client.run("receive", "--timeout", str(seconds)), as_json)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli backfill --json")
 @click.option("--json", "as_json", is_flag=True)
 @click.pass_obj
 def backfill(client, as_json):
@@ -388,7 +388,7 @@ def backfill(client, as_json):
     emit(client.run("importHistory"), as_json)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli read Alice\n  signal-cli read Friends --limit 20 --json")
 @click.argument("peer")
 @click.option("--limit", type=click.IntRange(min=1), default=50)
 @click.option("--json", "as_json", is_flag=True)
@@ -407,7 +407,7 @@ def read(client, peer, limit, as_json):
     emit([dict(row) for row in reversed(rows)], as_json)
 
 
-@cli.command()
+@cli.command(epilog="\b\nExamples:\n  signal-cli send Alice \"hello\"\n  signal-cli send Alice \"report\" --doc report.pdf --yes")
 @click.argument("peer")
 @click.argument("text", required=False)
 @click.option("--doc", type=click.Path(exists=True, dir_okay=False, path_type=Path))
@@ -454,8 +454,3 @@ def send(client, peer, text, doc, from_stdin, yes, as_json):
 cli.add_command(pull, "sync")
 cli.add_command(list_chats, "chats")
 cli.add_command(backfill, "history")
-
-# Signal follows the same app-managed write restrictions as the other connectors.
-from wa.onebrain_policy import install as _install_policy
-
-_install_policy(cli, "signal")

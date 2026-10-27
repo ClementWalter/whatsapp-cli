@@ -233,7 +233,7 @@ func handleLtHashApply(out *bufio.Writer, arg json.RawMessage) {
 }
 
 // xeddsa_sign: { priv:"b64 (32)", message:"b64" } → { pub:"b64", signature:"b64 (64)" }
-// Uses libsignal's XEdDSA (Curve25519 key, Ed25519-shape signature). The
+// Uses libsignal's XEdDSA (Curve25519 key, Ed25519-shape signature). The gitleaks:allow
 // underlying impl reads 64 bytes of randomness internally.
 func handleXeddsaSign(out *bufio.Writer, arg json.RawMessage) {
 	var req struct {

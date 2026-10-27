@@ -94,7 +94,7 @@ def save_contacts(contacts: dict[str, str]) -> None:
 
 
 def load_lidmap() -> dict[str, str]:
-    """``lid_jid_local_part → pn_jid`` (e.g. ``42997622276200`` → ``33687776779@s.whatsapp.net``).
+    """``lid_jid_local_part → pn_jid`` (e.g. ``10000000000002`` → ``33600000001@s.whatsapp.net``).
 
     The local part of the LID is what appears as the "sender" of group
     messages in our cached messages.jsonl, so we key by that for fast

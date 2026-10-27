@@ -38,7 +38,7 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.setuptools.package-data]
-wa = ["signal_native/*.mjs", "signal_native/*.json", "signal_native/*.md", "signal_native/*.pem", "signal_native/protos/*.proto", "signal_native/protos/LICENSE"]
+wa = ["signal_native/*.mjs", "signal_native/*.json", "signal_native/*.md", "signal_native/*.crt", "signal_native/protos/*.proto", "signal_native/protos/LICENSE"]
 
 [tool.setuptools.packages.find]
 include = ["wa*"]

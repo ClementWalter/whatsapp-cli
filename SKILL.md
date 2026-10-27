@@ -19,13 +19,10 @@ an uncommitted edit, takes effect immediately with nothing to reinstall.
 wa list
 ```
 
-Examples in this doc are written that way. If `wa` is not on `$PATH`, run the
-bundled launcher `bin/wa` resolved against this skill's own directory (PEP 723
-— `uv` resolves deps inline on first run), or link it once:
-
-```bash
-ln -sfn <skill-dir>/bin/wa ~/.local/bin/wa
-```
+Examples in this doc are written that way. `claudine/scripts/link_clis.py`
+puts `wa` and `signal-cli` on `$PATH`. If `wa` is not on `$PATH`, run the
+bundled launcher `<skill-dir>/bin/wa` (PEP 723 — `uv` resolves deps inline on
+first run).
 
 **Do not `uv tool install` this package.** That copies a snapshot, so `wa` keeps
 running install-day code while the checkout moves on, and a newly added command
@@ -34,21 +31,7 @@ slower to start than the PEP 723 launcher, which reuses uv's warm dependency cac
 either way. The `pyproject.toml` here exists for the test group
 (`uv run --group test pytest`), not for installing the CLI.
 
-## When to use
-
-Trigger this skill when the user wants to:
-
-- read their own WhatsApp messages (`wa read alice`)
-- catch up after being offline (`wa pull`)
-- send a 1:1 or group message (`wa send "Pierre" "hello"`)
-- share a document / PDF (`wa send "Pierre" --doc report.pdf`)
-- list, search, or count their chats programmatically (`wa list --json`)
-- check whether the CLI is paired or how recent the last sync was (`wa status`)
-
-Do **not** use it when the user wants to operate on someone else's account,
-use the WhatsApp Business API, or scrape a web UI.
-
-## First-time setup
+## Authentication
 
 ```bash
 # Pair as a linked device — prints a QR code in the terminal. The user
@@ -66,11 +49,18 @@ State lives in:
 - `~/.config/whatsapp-cli/signal.json` — Signal ratchet + sender keys
 - `~/.cache/whatsapp-cli/store/` — chats, contacts, messages cache
 
-## Commands
+## Output conventions
 
-All commands print human-readable output to stdout and structured logs to
-stderr. Use `--json` where supported for machine parsing. Pass `--debug` on
-the top level (`wa --debug ...`) for verbose protocol logs.
+- All commands write to stdout/stderr in UTF-8.
+- Exit code 0 on success, 1 on error (e.g. not paired, no chat matching
+  query).
+- `--json` mode emits a single JSON document; everything else is rendered
+  for human reading.
+- Data goes to stdout; logs and progress go to stderr. Use `--json` where
+  supported for machine parsing. Pass `--debug` on the top level
+  (`wa --debug ...`) for verbose protocol logs.
+
+## Commands
 
 ### `wa status`
 Show pairing state and last sync. Use to verify the user is set up before
@@ -286,7 +276,7 @@ devices, this runs the same drain as `wa pull` but with a full
 group-info refresh that resolves all contact display names from group
 participants (slower — ~5s cold, ~0s warm).
 
-## Common workflows
+## Recipes
 
 ### "Catch me up, what's been happening?"
 ```bash
@@ -334,13 +324,45 @@ jq '.coverage' /tmp/chat.json
 jq -r '.messages[] | select(.text | test("pitch|deck"; "i")) | "\(.ts|todate) \(.sender_name): \(.text)"' /tmp/chat.json
 ```
 
-## Output and exit codes
+## Gotchas
 
-- All commands write to stdout/stderr in UTF-8.
-- Exit code 0 on success, 1 on error (e.g. not paired, no chat matching
-  query).
-- `--json` mode emits a single JSON document; everything else is rendered
-  for human reading.
+- **Single connection at a time.** A file lock prevents two `wa`
+  processes from connecting simultaneously; the second one blocks until
+  the first finishes. This includes `backfill`, which holds it for its whole
+  window — don't try to `read --limit` in parallel, and stub
+  `wa.cache.connection_lock` in tests so the suite never waits on a live
+  session.
+- **No daemon.** Messages only land locally when you run `wa pull`
+  (or any other connecting command). There's no push. Consequence worth
+  internalising: the phone only serves chat history while a companion is
+  *concurrently* connected, so any window this CLI opens is a few seconds
+  wide unless you ask for one explicitly (`wa backfill`).
+- **`(unnamed)` chats are normal initially.** WhatsApp's app-state
+  doesn't ship contact labels to linked devices; run
+  `wa import-contacts` (macOS) or let group-info backfill resolve
+  them via `wa login`.
+- **Some group `skmsg` decrypt warnings are expected** ("invalid send key
+  id"). They mean the sender first distributed their group key while we
+  were disconnected, so we never received it. Future messages from that
+  sender in that group will decrypt fine once they redistribute.
+- **Reverse-engineered protocol.** Meta has historically sent C&D letters
+  to similar projects (Baileys). Scoped to single-user personal tooling,
+  not a service. The user should not run this on a number they can't
+  afford to have banned.
+
+## When to use
+
+Trigger this skill when the user wants to:
+
+- read their own WhatsApp messages (`wa read alice`)
+- catch up after being offline (`wa pull`)
+- send a 1:1 or group message (`wa send "Pierre" "hello"`)
+- share a document / PDF (`wa send "Pierre" --doc report.pdf`)
+- list, search, or count their chats programmatically (`wa list --json`)
+- check whether the CLI is paired or how recent the last sync was (`wa status`)
+
+Do **not** use it when the user wants to operate on someone else's account,
+use the WhatsApp Business API, or scrape a web UI.
 
 ## Recovering missing messages
 
@@ -395,7 +417,7 @@ is true of this path (verified live, 2026-10-26):
   answers type 3 for any request anchored on the oldest of a run of them,
   whatever id or timestamp is sent, so nothing older than the placeholders
   can be paged in. `coverage` marks such a chat as never `complete` and says
-  so in its `note`. Verified on 2026-10-26: Rand Hindi's chat stops at six
+  so in its `note`. Verified on 2026-10-26: one 1:1 chat stops at six
   2023-05-15 placeholders (msgOrderID 292, so about 291 older messages
   exist on the phone, back to 2022).
 
@@ -423,32 +445,6 @@ forwarding. Record which chat and date the forwards came from yourself.
 
 `0 frames — caught up` means the server had nothing queued. It is **not**
 evidence that the local store matches the phone.
-
-## Things to know
-
-- **Single connection at a time.** A file lock prevents two `wa`
-  processes from connecting simultaneously; the second one blocks until
-  the first finishes. This includes `backfill`, which holds it for its whole
-  window — don't try to `read --limit` in parallel, and stub
-  `wa.cache.connection_lock` in tests so the suite never waits on a live
-  session.
-- **No daemon.** Messages only land locally when you run `wa pull`
-  (or any other connecting command). There's no push. Consequence worth
-  internalising: the phone only serves chat history while a companion is
-  *concurrently* connected, so any window this CLI opens is a few seconds
-  wide unless you ask for one explicitly (`wa backfill`).
-- **`(unnamed)` chats are normal initially.** WhatsApp's app-state
-  doesn't ship contact labels to linked devices; run
-  `wa import-contacts` (macOS) or let group-info backfill resolve
-  them via `wa login`.
-- **Some group `skmsg` decrypt warnings are expected** ("invalid send key
-  id"). They mean the sender first distributed their group key while we
-  were disconnected, so we never received it. Future messages from that
-  sender in that group will decrypt fine once they redistribute.
-- **Reverse-engineered protocol.** Meta has historically sent C&D letters
-  to similar projects (Baileys). Scoped to single-user personal tooling,
-  not a service. The user should not run this on a number they can't
-  afford to have banned.
 
 ## Project layout (for development questions)
 

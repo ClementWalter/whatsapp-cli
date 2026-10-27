@@ -39,7 +39,7 @@ def test_audio_seconds_and_ptt_are_read():
 
 
 def test_audio_through_device_sent_wrapper():
-    assert extract_media(wrap_device_sent(audio_message(), "77253627113618@lid"))["direct_path"] == "/v/t62.7117-24/abc.enc"
+    assert extract_media(wrap_device_sent(audio_message(), "10000000000000@lid"))["direct_path"] == "/v/t62.7117-24/abc.enc"
 
 
 def test_plain_text_has_no_media():

@@ -12,7 +12,7 @@ are recorded in `package-lock.json`.
 Provisioning, sealed-sender trust roots, backup framing, and service endpoints
 follow the Signal Desktop sources at that commit. The JavaScript modules here
 implement this repository's client; no external Signal executable is launched.
-`signal-ca.pem` is the `certificateAuthority` value from its `config/default.json`.
+`signal-ca.crt` is the `certificateAuthority` value from its `config/default.json`.
 
 The account-data test fixture is derived from the libsignal `v0.105.1`
 `rust/message-backup/tests/res/test-cases/valid/account-data.jsonproto` fixture,

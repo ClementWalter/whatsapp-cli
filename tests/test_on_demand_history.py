@@ -59,7 +59,7 @@ def blob_dir(tmp_path, monkeypatch):
 
 
 def _save_blob(blob_dir, ms: int, payload: bytes):
-    path = blob_dir / f"{ms}-protocolMessage-77253627113618-0-0-{len(payload)}.bin"
+    path = blob_dir / f"{ms}-protocolMessage-10000000000000-0-0-{len(payload)}.bin"
     path.write_bytes(payload)
     return path
 
@@ -405,19 +405,19 @@ def test_encode_roundtrip_keeps_category():
 
 # --- chat JID forms ---------------------------------------------------------
 
-LID_CHAT = "148816456101931@lid"
-PN_CHAT = "33669524000@s.whatsapp.net"
+LID_CHAT = "100000000000001@lid"
+PN_CHAT = "33600000000@s.whatsapp.net"
 
 
 @pytest.mark.parametrize(
     ("chat", "lidmap", "expected"),
     [
-        (LID_CHAT, {"148816456101931": PN_CHAT}, [PN_CHAT, LID_CHAT]),
+        (LID_CHAT, {"100000000000001": PN_CHAT}, [PN_CHAT, LID_CHAT]),
         (LID_CHAT, {}, [LID_CHAT]),
         (
-            "120363092017791687@g.us",
-            {"148816456101931": PN_CHAT},
-            ["120363092017791687@g.us"],
+            "120363000000000000@g.us",
+            {"100000000000001": PN_CHAT},
+            ["120363000000000000@g.us"],
         ),
     ],
     ids=["lid-with-known-number", "lid-without-number", "group"],
@@ -443,7 +443,7 @@ def store(tmp_path, monkeypatch):
         "LIDMAP_PATH": store_dir / "lidmap.json",
     }.items():
         monkeypatch.setattr(cache, name, path)
-    (store_dir / "lidmap.json").write_text(json.dumps({"148816456101931": PN_CHAT}))
+    (store_dir / "lidmap.json").write_text(json.dumps({"100000000000001": PN_CHAT}))
     return cache
 
 
@@ -566,8 +566,8 @@ def test_placeholder_note_names_the_placeholders():
 
 
 def test_self_chat_is_requested_by_its_lid_first():
-    lidmap = {"77253627113618": "33629442167@s.whatsapp.net"}
-    assert cli._on_demand_chat_jids("77253627113618@lid", lidmap, "77253627113618") == [
-        "77253627113618@lid",
-        "33629442167@s.whatsapp.net",
+    lidmap = {"10000000000000": "33612345678@s.whatsapp.net"}
+    assert cli._on_demand_chat_jids("10000000000000@lid", lidmap, "10000000000000") == [
+        "10000000000000@lid",
+        "33612345678@s.whatsapp.net",
     ]

@@ -1,0 +1,6 @@
+# Upstream public data, not secrets: WhatsApp's binary token dictionary, a
+# libsignal test fixture, and an oracle doc comment.
+8f9fb04ca138922b1e49190f3f8cc00eebbe0b1d:wa/wabinary/_tokens_data.py:gcp-api-key:822
+8f9fb04ca138922b1e49190f3f8cc00eebbe0b1d:tools/oracle/main.go:generic-api-key:236
+e7a99c81a9792843e82f479679bf679d2116a73a:wa/signal_native/test/fixtures/account-data.json:generic-api-key:9
+wa/signal_native/test/fixtures/account-data.json:generic-api-key:9

@@ -27,7 +27,7 @@ def test_extract_quoted_id_from_reply():
 
 
 def test_extract_quoted_id_through_device_sent_wrapper():
-    assert extract_quoted_id(wrap_device_sent(reply(), "77253627113618@lid")) == QUOTED_ID
+    assert extract_quoted_id(wrap_device_sent(reply(), "10000000000000@lid")) == QUOTED_ID
 
 
 def test_plain_conversation_is_not_a_reply():
@@ -53,4 +53,4 @@ def test_context_participant_is_bare_jid():
 def test_quoted_ref_strips_device_suffix():
     from wa.messages import QuotedRef
 
-    assert QuotedRef.from_cached("id", "33629442167:25@s.whatsapp.net", "t").participant == "33629442167@s.whatsapp.net"
+    assert QuotedRef.from_cached("id", "33612345678:25@s.whatsapp.net", "t").participant == "33612345678@s.whatsapp.net"

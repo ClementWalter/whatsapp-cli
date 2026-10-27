@@ -8,7 +8,7 @@ import { decode } from "./protocol.mjs";
 
 const certificateAuthorities = [
 	...rootCertificates,
-	fs.readFileSync(new URL("./signal-ca.pem", import.meta.url), "utf8"),
+	fs.readFileSync(new URL("./signal-ca.crt", import.meta.url), "utf8"),
 ];
 
 export function cdnRequest(
