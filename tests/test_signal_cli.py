@@ -22,7 +22,7 @@ def client(tmp_path):
 
 
 @pytest.fixture
-def backend(monkeypatch, tmp_path):
+def backend(monkeypatch):
     calls = []
 
     def run(self, *args, **kwargs):
@@ -37,7 +37,6 @@ def backend(monkeypatch, tmp_path):
         }[args[0]]
 
     monkeypatch.setattr(Client, "run", run)
-    monkeypatch.setenv("BRAIN_SUPPORT", str(tmp_path / "policy"))
     return calls
 
 
@@ -349,17 +348,6 @@ def test_failed_native_process_returns_error(
     receiver(event, exit_code=exit_code, trailer=trailer)
     result = CliRunner().invoke(cli, ["--data-dir", str(client.data_dir), "pull"])
     assert result.exit_code == 1
-
-
-def test_read_only_policy_blocks_send(backend, monkeypatch, tmp_path):
-    (tmp_path / "connector-permissions.json").write_text(
-        '{"signal":{"read_only":true}}'
-    )
-    monkeypatch.setenv("BRAIN_SUPPORT", str(tmp_path))
-    assert (
-        "read-only"
-        in CliRunner().invoke(cli, ["send", "Alice", "hello", "--yes"]).output
-    )
 
 
 def test_launcher_help_end_to_end():

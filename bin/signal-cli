@@ -1,7 +1,13 @@
 #!/usr/bin/env -S uv run --script
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["click==8.3.3", "qrcode[pil]==8.2"]
+# dependencies = [
+#     "click==8.3.3",
+#     "qrcode[pil]==8.2",
+# ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Launch the Signal companion CLI from a checkout without installation."""
 

@@ -12,6 +12,9 @@
 #     "signal-protocol==0.2.2",
 #     "pyobjc-framework-Contacts==12.1; sys_platform == 'darwin'",
 # ]
+#
+# [tool.uv]
+# exclude-newer = "2026-10-27T00:00:00Z"
 # ///
 """Standalone launcher for the WhatsApp CLI.
 
