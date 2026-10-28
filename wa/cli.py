@@ -12,6 +12,7 @@ import asyncio
 import json
 import logging
 import os
+import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -886,6 +887,135 @@ def login(reset: bool) -> None:
 
     with connection_lock():
         asyncio.run(_login_async(dev))
+
+
+LINK_TIMEOUT = 300
+LINK_PAGE = """<!doctype html><meta charset=utf-8><title>Link WhatsApp</title>
+<style>body{font:16px system-ui;max-width:28rem;margin:3rem auto;text-align:center}svg{width:16rem;height:16rem}</style>
+<h1>Link WhatsApp</h1><div id=s>Connecting to WhatsApp…</div>
+<script>
+const s=document.getElementById('s');
+async function tick(){const r=await (await fetch('state')).json();
+ if(r.step==='qr')s.innerHTML='<p>On your phone: WhatsApp → Settings → <b>Linked devices</b> → Link a device, then scan:</p>'+r.svg;
+ else if(r.step==='done'){s.textContent='Linked as '+r.name+'. You can close this page.';return}
+ else if(r.step==='failed'){s.textContent='Failed: '+r.error;return}
+ setTimeout(tick,1000)}
+tick();
+</script>"""
+
+
+def _link_state_path():
+    return DEFAULT_DEVICE_PATH.parent / "link.json"
+
+
+def _qr_svg(payload: str) -> str:
+    import qrcode
+    import qrcode.image.svg
+
+    return qrcode.make(payload, image_factory=qrcode.image.svg.SvgPathImage).to_string(encoding="unicode")
+
+
+def _link_helper(reset: bool) -> None:
+    """Serve the QR page on 127.0.0.1 and pair until done or timed out."""
+    import secrets
+    import threading
+    import time as _time
+    import webbrowser
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    state: dict = {"step": "starting"}
+    # A random path keeps other local pages and processes from reading the QR.
+    token = secrets.token_urlsafe(16)
+
+    class Page(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == f"/{token}/":
+                body, kind = LINK_PAGE, "text/html; charset=utf-8"
+            elif self.path == f"/{token}/state":
+                body, kind = json.dumps(state), "application/json"
+            else:
+                self.send_error(404)
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+        def log_message(self, *args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Page)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_port}/{token}/"
+    link_state = _link_state_path()
+    link_state.parent.mkdir(parents=True, exist_ok=True)
+    link_state.write_text(json.dumps({"url": url, "pid": os.getpid()}))
+    link_state.chmod(0o600)
+    webbrowser.open(url)
+
+    dev = None if reset else Device.load()
+    if dev is None:
+        dev = Device.new()
+        dev.save()
+    from wa.cache import connection_lock
+
+    try:
+        with connection_lock():
+            asyncio.run(asyncio.wait_for(
+                _login_async(dev, on_qr=lambda payload: state.update(step="qr", svg=_qr_svg(payload))), LINK_TIMEOUT
+            ))
+        dev = Device.load()
+        if dev is not None and dev.is_paired():
+            state.update(step="done", svg=None, name=dev.push_name or str(dev.jid))
+        else:
+            state.update(step="failed", svg=None, error="the QR code was not scanned in time")
+    except BaseException as exc:  # noqa: BLE001 — shown on the page; the helper has no other reader
+        state.update(step="failed", svg=None, error=str(exc) or type(exc).__name__)
+    # Let the page poll the final state before the server goes away.
+    _time.sleep(5)
+    server.shutdown()
+    link_state.unlink(missing_ok=True)
+
+
+@cli.command(epilog="\b\nExamples:\n  wa link\n  wa link --reset")
+@click.option("--reset", is_flag=True, help="Discard any existing device state and pair again.")
+@click.option("--helper", is_flag=True, hidden=True, help="Run the page and pairing in this process.")
+def link(reset: bool, helper: bool) -> None:
+    """Link WhatsApp to this computer by scanning a QR code; no terminal needed.
+
+    Opens a local page in the browser with the QR code; scan it from the phone
+    (WhatsApp → Settings → Linked devices → Link a device). Returns at once:
+    check the result with `status`, then `pull` to fetch messages. The page stays
+    up for 5 minutes.
+    """
+    if helper:
+        _link_helper(reset)
+        return
+    dev = Device.load()
+    if dev is not None and dev.is_paired() and not reset:
+        click.echo(f"already linked as {dev.jid} ({dev.push_name or '?'}); pass --reset to pair again")
+        return
+    link_state = _link_state_path()
+    link_state.unlink(missing_ok=True)
+    # Detached so the page outlives this command, which an MCP client waits on.
+    subprocess.Popen(
+        [sys.executable, "-m", "wa.cli", "link", "--helper", *(["--reset"] if reset else [])],
+        cwd=str(Path(__file__).resolve().parent.parent),
+        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+    )
+    import time as _time
+
+    for _ in range(100):
+        if link_state.exists():
+            url = json.loads(link_state.read_text())["url"]
+            click.echo(
+                f"A page opened in the browser ({url}). On your phone: WhatsApp → Settings → Linked devices → "
+                "Link a device, and scan the QR code. Then check with `wa status` and fetch messages with `wa pull`."
+            )
+            return
+        _time.sleep(0.1)
+    raise click.ClickException("the link page did not start; run `wa link --helper` to see why")
 
 
 @cli.command("pull", epilog="\b\nExamples:\n  wa pull\n  wa sync --idle 5 --refresh-groups")
@@ -2322,7 +2452,9 @@ async def _send_group_async(
             await session.stop()
 
 
-async def _login_async(device: Device) -> None:
+async def _login_async(device: Device, on_qr=None) -> None:
+    """Pair (QR) if needed, then log in. on_qr receives each QR payload; default prints it."""
+    show = on_qr or (lambda payload: click.echo("\n" + render_qr_ansi(payload)))
     # Fast path for already-paired devices: skip the QR dance and go
     # straight to the login-handshake. This is also what runs after a
     # successful pair, to consummate the link.
@@ -2362,7 +2494,7 @@ async def _login_async(device: Device) -> None:
         await fs.send(ns.encrypt_frame(encode_node(ack)))
 
         click.echo(f"got {len(refs)} pair refs; showing first")
-        click.echo("\n" + render_qr_ansi(make_qr_payload(refs[0], device)))
+        show(make_qr_payload(refs[0], device))
         click.echo("scan this with WhatsApp → Linked Devices → Link a device")
 
         # Wait for pair-success. The server also sends a new <ref> every ~30s;
@@ -2396,7 +2528,7 @@ async def _login_async(device: Device) -> None:
                 # Server refreshed refs — either scan the new one or wait.
                 new_refs = extract_pair_refs(node)
                 if new_refs and ref_index < len(new_refs):
-                    click.echo("\n" + render_qr_ansi(make_qr_payload(new_refs[0], device)))
+                    show(make_qr_payload(new_refs[0], device))
                     ref_index += 1
                 ack = build_pair_device_ack(node)
                 await fs.send(ns.encrypt_frame(encode_node(ack)))

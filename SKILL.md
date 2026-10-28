@@ -38,6 +38,10 @@ either way. The `pyproject.toml` here exists for the test group
 # scans it from their phone (WhatsApp → Settings → Linked Devices → Link).
 wa login
 
+# Without a terminal (Claude Desktop, Cowork): opens a local page with the QR
+# code and returns at once; the page stays up 5 minutes.
+wa link
+
 # Verify.
 wa status
 # → paired as 33123456789:23@s.whatsapp.net (...) on iphone
