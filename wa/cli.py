@@ -841,12 +841,12 @@ def status() -> None:
     """Show whether we have a paired device on disk."""
     dev = Device.load()
     if dev is None:
-        click.echo(f"not logged in (no device at {DEFAULT_DEVICE_PATH})")
+        click.echo(f"not logged in (no device at {DEFAULT_DEVICE_PATH}); run `wa link` to scan a QR code")
         return
     if dev.is_paired():
         click.echo(f"paired as {dev.jid} ({dev.push_name or '?'}) on {dev.platform}")
     else:
-        click.echo("keys generated but not paired — run `login` to scan a QR")
+        click.echo("keys generated but not paired — run `wa link` to scan a QR code")
         return
 
     from wa.cache import load_sync_state

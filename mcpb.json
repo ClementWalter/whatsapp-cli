@@ -1,0 +1,11 @@
+{
+  "display_name": "WhatsApp",
+  "description": "Read, search and send your own WhatsApp chats from Claude.",
+  "long_description": "Connects to your WhatsApp account as a linked device, like WhatsApp Desktop.\n\nSetup: in Claude, ask \"link my WhatsApp\". A page with a QR code opens in your browser. On your phone: WhatsApp → Settings → Linked devices → Link a device, and scan it. Then ask Claude to pull your messages.\n\nYour keys and messages stay on this Mac. You can unlink it any time from WhatsApp → Settings → Linked devices.",
+  "platforms": [
+    "darwin"
+  ],
+  "build_wheels": [
+    "signal-protocol==0.2.2"
+  ]
+}
