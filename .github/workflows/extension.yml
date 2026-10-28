@@ -1,0 +1,18 @@
+# Claude Desktop extension: a v* tag publishes whatsapp-cli.mcpb on its GitHub release.
+name: extension
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  extension:
+    permissions:
+      contents: write
+    uses: ClementWalter/mcp-bridge/.github/workflows/extension.yml@411dc73ae9d58b6e4358082630c29cf4b1680e8e
+    with:
+      launcher: bin/wa
+      bridge-ref: 411dc73ae9d58b6e4358082630c29cf4b1680e8e
