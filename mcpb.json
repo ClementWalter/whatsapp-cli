@@ -7,5 +7,13 @@
   ],
   "build_wheels": [
     "signal-protocol==0.2.2"
-  ]
+  ],
+  "site": {
+    "group": "messages",
+    "rank": 20,
+    "needs": [
+      "Your phone with WhatsApp, to scan a QR code once"
+    ],
+    "risk": "This is an unofficial client of WhatsApp's protocol, not an app approved by WhatsApp. Using it is against WhatsApp's terms of service, and WhatsApp can restrict or ban accounts that use unofficial clients. Use it only if you accept that risk."
+  }
 }
