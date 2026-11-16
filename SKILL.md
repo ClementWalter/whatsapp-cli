@@ -72,12 +72,31 @@ running any other command.
 
 ### `wa pull` / `wa sync` `[--seconds N] [--idle N] [--refresh-groups]`
 Reconnect, drain the **server** mailbox, exit when the queue goes idle for
-`--idle` seconds (default 3). `--seconds` is a hard cap (default 120). Use
-before `wa list` / `wa read` if the user wants fresh data. `sync` is an alias.
+`--idle` seconds (default 3). `--seconds` (default 120) caps only the drain
+loop. Use before `wa list` / `wa read` if the user wants fresh data. `sync` is
+an alias.
+
+Duration scales with the backlog, not with a fixed budget:
+
+- A few minutes offline: a few seconds.
+- A day or more offline: hundreds of frames, several minutes. 200 to 800
+  frames after about a day has taken past 120s.
+- The wall time exceeds `--seconds`: connecting and resolving unnamed groups
+  run before the drain, and downloading and ingesting the history bundles the
+  phone pushed runs after it, neither under the cap. When another `wa`
+  process holds the connection lock, `pull` also waits for it first.
+- Hitting the cap still exits 0 and leaves the rest queued. Run `pull` again
+  until it drains a small frame count.
+
+For agents: run `pull` on its own, in the background, or with an explicit Bash
+timeout well above `--seconds` (e.g. 600000 ms for the default cap). Never
+chain it with other commands in one foreground call (`wa status; wa sync;
+wa chats`): the chain inherits the pull's duration and blows the default
+120s tool timeout. Run `wa list` / `wa read` after it exits.
 
 ```bash
-wa pull                  # quick catch-up, ~3-30s depending on backlog
-wa pull --seconds 300    # bigger cap after weeks offline
+wa pull                  # seconds when recent, minutes after a day+ offline
+wa pull --seconds 300    # bigger drain cap after days or weeks offline
 ```
 
 `pull` only ingests what the **server** has queued. It reports `0 frames —
@@ -284,7 +303,8 @@ participants (slower — ~5s cold, ~0s warm).
 
 ### "Catch me up, what's been happening?"
 ```bash
-wa pull && wa list --limit 30
+wa pull                 # alone, in the background or with a long timeout
+wa list --limit 30
 ```
 
 ### "A chat is missing its latest messages"
@@ -297,7 +317,8 @@ messages were never encrypted for this device and only the phone has them.
 
 ### "Show me messages from <someone>"
 ```bash
-wa pull && wa read "<their name>" --limit 100
+wa pull                 # alone, in the background or with a long timeout
+wa read "<their name>" --limit 100
 ```
 
 ### "Send a message to <someone>"
