@@ -94,10 +94,17 @@ wa list --limit 200 --json            # cached conversations
 wa read "Alice" --limit 50
 wa read "Alice" --match 2             # choose a match after an ambiguity warning
 wa read "Alice" --no-extend --json    # cached messages only
+wa read "Alice" --no-transcribe       # leave voice notes as [audio]
 wa listen                            # stay connected; stream messages as JSON lines
 wa backfill --minutes 15              # keep the connection open for phone history
 wa import-contacts                   # macOS Contacts.app names
 ```
+
+`read` transcribes the voice notes it shows with
+[transcribe-cli](https://github.com/ClementWalter/transcribe-cli) (local
+Whisper or parakeet) when its `transcribe` command is on `PATH`, or at
+`WA_TRANSCRIBE_BIN`. Transcripts are cached per message, so each note is
+transcribed once.
 
 For phone history sync, keep WhatsApp open in the foreground on the phone
 while `backfill` runs. `pull` drains the server queue and normally exits after

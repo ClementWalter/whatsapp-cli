@@ -555,7 +555,7 @@ def chats(limit: int, json_out: bool) -> None:
 cli.add_command(chats, "chats")
 
 
-@cli.command(epilog="\b\nExamples:\n  wa read alice\n  wa read 33612345678 --limit 50 --json\n  wa read alice --no-extend                    # offline, fast\n  wa read alice --match 2                      # pick 2nd of ambiguous matches\n  wa read 10000000000000@lid                   # exact JID, never ambiguous\n  wa read alice --since 2022-01-01 --limit 0   # page back to 2022, show all")
+@cli.command(epilog="\b\nExamples:\n  wa read alice\n  wa read 33612345678 --limit 50 --json\n  wa read alice --no-extend                    # offline, fast\n  wa read alice --match 2                      # pick 2nd of ambiguous matches\n  wa read 10000000000000@lid                   # exact JID, never ambiguous\n  wa read alice --since 2022-01-01 --limit 0   # page back to 2022, show all\n  wa read alice --no-transcribe                # leave voice notes as [audio]")
 @click.argument("query")
 @click.option("--limit", type=int, default=20, help="Max messages to show")
 @click.option("--json", "json_out", is_flag=True, help="Emit JSON")
@@ -588,6 +588,14 @@ cli.add_command(chats, "chats")
     show_default=True,
     help="Seconds to wait for the phone's answer to each history request.",
 )
+@click.option(
+    "--transcribe/--no-transcribe",
+    "transcribe",
+    default=True,
+    show_default=True,
+    help="Transcribe the voice notes shown, with the `transcribe` CLI "
+    "(transcribe-cli, or WA_TRANSCRIBE_BIN). Cached per message.",
+)
 def read(
     query: str,
     limit: int,
@@ -596,6 +604,7 @@ def read(
     match_index: int | None,
     since,
     reply_wait: float,
+    transcribe: bool,
 ) -> None:
     """Show recent messages from a chat (matched by name or JID substring).
 
@@ -608,6 +617,11 @@ def read(
     The JSON ``coverage`` object (and a stderr note in text mode) states
     the oldest cached date and why paging stopped, so a short result is
     never mistaken for the whole chat.
+
+    Voice notes among the shown messages are transcribed locally by the
+    `transcribe` CLI (transcribe-cli) and cached, so each note costs one
+    transcription ever: JSON carries ``transcript: {text, language}``, text
+    mode appends ``«...»`` after ``[audio]``. ``--no-transcribe`` skips it.
     """
     since_ts = int(since.timestamp()) if since is not None else None
     from wa.cache import find_chat, iter_messages, load_chats, load_contacts, load_lidmap
@@ -760,6 +774,7 @@ def read(
     rows = [m for m in rows_all if since_ts is None or m.ts >= since_ts]
     rows.sort(key=lambda m: m.ts)
     rows = rows[-limit:] if limit > 0 else rows
+    transcripts = _read_transcripts(rows) if transcribe else {}
 
     if json_out:
         click.echo(
@@ -778,6 +793,7 @@ def read(
                             "msg_id": m.msg_id,
                             "quoted_id": m.quoted_id,
                             "media": m.media,
+                            "transcript": transcripts.get(m.msg_id),
                         }
                         for m in rows
                     ],
@@ -797,12 +813,40 @@ def read(
         ts = datetime.fromtimestamp(m.ts).strftime("%Y-%m-%d %H:%M")
         who = "me" if m.from_me else resolve(m.sender, m.sender_name)
         text = m.text or "[non-text]"
+        if transcript := transcripts.get(m.msg_id):
+            text = f"{text} «{transcript['text']}»"
         if m.quoted_id:
             # Show what a reply quotes, like the phone does above the bubble.
             quoted = by_id.get(m.quoted_id)
             snippet = (quoted.text[:40] + "…") if quoted and len(quoted.text) > 40 else (quoted.text if quoted else m.quoted_id)
             text = f"↩︎ «{snippet}» {text}"
         click.echo(f"{ts}  {who}: {text}")
+
+
+def _read_transcripts(rows: list) -> dict[str, dict]:
+    """Transcripts of the voice notes in ``rows``, noting on stderr what could not be transcribed."""
+    from wa.transcripts import is_audio, transcribe_bin, transcribe_messages
+
+    audio = [m for m in rows if m.msg_id and is_audio(m.media)]
+    if not audio:
+        return {}
+    binary = transcribe_bin()
+    if binary is None:
+        click.echo(
+            click.style(
+                f"{len(audio)} voice note(s) left untranscribed: install transcribe-cli "
+                "(`transcribe` on PATH) or set WA_TRANSCRIBE_BIN",
+                fg="yellow",
+            ),
+            err=True,
+        )
+    transcripts = transcribe_messages(audio, binary=binary)
+    if binary is not None and len(transcripts) < len(audio):
+        click.echo(
+            click.style(f"{len(audio) - len(transcripts)} voice note(s) could not be transcribed", fg="yellow"),
+            err=True,
+        )
+    return transcripts
 
 
 @cli.command(epilog="\b\nExamples:\n  wa download 3EB0123456789ABCDEF0 -o ~/Downloads/")
