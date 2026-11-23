@@ -147,7 +147,7 @@ limit 20. Offline — does not open a socket. `chats` is an alias.
 `display_name` field falls back to `contacts.json` when the app-state name
 is empty (DMs).
 
-### `wa read <query> [--limit N] [--since YYYY-MM-DD] [--match N] [--no-extend] [--wait S] [--json]`
+### `wa read <query> [--limit N] [--since YYYY-MM-DD] [--match N] [--no-extend] [--wait S] [--no-transcribe] [--json]`
 Show messages from a single chat. `<query>` is a fuzzy substring match
 against chat names, JIDs, and contact names (case-insensitive). Ambiguous
 queries print a numbered list — pick with `--match N` or pass a full JID.
@@ -160,6 +160,7 @@ wa read famille --limit 100     # bigger window
 wa read alice --no-extend       # offline, cached only — no network
 wa read alice --json            # machine-readable
 wa read alice --since 2022-01-01 --limit 0 --json   # page back to 2022, all of it
+wa read alice --no-transcribe   # leave voice notes as [audio]
 ```
 
 Each `--json` message carries `msg_id`, `quoted_id` and `media`: `quoted_id`
@@ -174,6 +175,21 @@ request, re-anchoring on the oldest cached message each time, until it has
 enough, reaches the date, or the phone has nothing older. Each request waits
 up to `--wait` seconds (default 180) for the phone. `--no-extend` skips the
 network round-trip.
+
+**Voice notes are transcribed.** Every audio message among the shown rows
+(voice-note bubble, or an audio file shared as a document) is downloaded and
+passed to `transcribe file --json` from
+[transcribe-cli](https://github.com/ClementWalter/transcribe-cli), which runs
+Whisper or parakeet locally. The result is cached per `msg_id` in
+`~/.cache/whatsapp-cli/store/transcripts.json`, so a note is transcribed once
+(a few seconds, minutes on the very first run while the model downloads) and
+every later read is instant. `--json` messages carry
+`transcript: {text, language}` (`null` for non-audio or untranscribed notes);
+plain output renders `[audio] «transcript»`. transcribe-cli is a runtime
+dependency found as `transcribe` on `PATH` (or `WA_TRANSCRIBE_BIN`); without
+it, `read` says on stderr how many notes stayed untranscribed and shows
+`[audio]`. A note whose CDN link expired cannot be fetched and stays
+untranscribed. `--no-transcribe` skips all of it.
 
 **Check `coverage` before concluding anything is absent.** `--json` output
 carries `coverage: {cached, oldest_date, stop, complete, note}`; text mode
@@ -486,6 +502,7 @@ whatsapp-cli/
     proto/            # vendored .proto schemas
     pair.py, handshake.py, clientpayload.py, store.py
     cache.py, history.py, peerreq.py, prekeys.py
+    transcripts.py    # voice-note transcripts via the `transcribe` CLI
   tools/oracle/       # Go binary wrapping whatsmeow for byte-diff tests
   tests/              # pytest, oracle-diffed
   pyproject.toml      # console-script entrypoint: wa = wa.cli:cli
