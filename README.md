@@ -100,11 +100,40 @@ wa backfill --minutes 15              # keep the connection open for phone histo
 wa import-contacts                   # macOS Contacts.app names
 ```
 
-`read` transcribes the voice notes it shows with
-[transcribe-cli](https://github.com/ClementWalter/transcribe-cli) (local
-Whisper or parakeet) when its `transcribe` command is on `PATH`, or at
-`WA_TRANSCRIBE_BIN`. Transcripts are cached per message, so each note is
-transcribed once.
+### Voice-note transcription
+
+`wa read` transcribes the voice notes it shows, so a chat reads as text
+instead of a row of `[audio]` bubbles:
+
+```text
+2026-11-23 16:38  Alice: [audio] «Hello, Wednesday works for me. See you later.»
+```
+
+Transcription runs locally through
+[transcribe-cli](https://github.com/ClementWalter/transcribe-cli) (Whisper
+large-v3-turbo or NVIDIA parakeet; MLX on Apple Silicon, CPU elsewhere).
+Nothing leaves the machine except the usual download of the encrypted audio
+from WhatsApp's CDN. It is an optional dependency: install it and put its
+`transcribe` command on `PATH`, or point `WA_TRANSCRIBE_BIN` at it.
+
+```bash
+git clone https://github.com/ClementWalter/transcribe-cli.git
+ln -s "$PWD/transcribe-cli/bin/transcribe" ~/.local/bin/transcribe
+
+wa read "Alice"                         # voice notes rendered as [audio] «...»
+wa read "Alice" --json                  # each message carries transcript: {text, language} or null
+wa read "Alice" --no-transcribe         # skip transcription, keep [audio]
+WA_TRANSCRIBE_BIN=/opt/bin/transcribe wa read "Alice"
+```
+
+- Voice-note bubbles and audio files shared as documents are both
+  transcribed; images, videos and other documents are not.
+- Each note is transcribed once and cached per message in
+  `~/.cache/whatsapp-cli/store/transcripts.json`. A note takes a few seconds;
+  the very first one also downloads the speech model (about 1.5 GB).
+- A note that fails (expired CDN link, decode error) is not cached, so the
+  next `read` retries it. Without transcribe-cli, `read` says on stderr how
+  many notes stayed untranscribed and shows `[audio]`.
 
 For phone history sync, keep WhatsApp open in the foreground on the phone
 while `backfill` runs. `pull` drains the server queue and normally exits after
@@ -187,6 +216,7 @@ history transfer have been verified; live file uploads still need verification.
 | Default Signal data directory | — | `$XDG_DATA_HOME/signal-cli`, or `~/.local/share/signal-cli` |
 | Continuous reception | `wa listen` | Run `pull` to receive queued messages |
 | Incoming attachments | Download with `wa download` | Not downloaded |
+| Voice-note transcripts | `~/.cache/whatsapp-cli/store/transcripts.json`, via transcribe-cli | Not transcribed |
 
 Signal's receive queue commits an encrypted copy before acknowledging delivery.
 Failed decryption remains queued for retry. Receiving does not send read receipts.
